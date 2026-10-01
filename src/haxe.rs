@@ -31,10 +31,14 @@ pub fn generate(
     webidl: &str,
     runtime: Runtime,
 ) -> Result<Vec<File>, String> {
-    let file = declaration.as_ref()
-        .map(|path| syn::parse_file(path.to_str().unwrap()))
-        .transpose()
-        .map_err(|e| e.to_string())?;
+    let desc_content = if let Some(path) = &declaration {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())?
+    } else {
+        String::new()
+    };
+
+    let file = syn::parse_file(&desc_content);
+
     let schema_namespace = namespace.rsplit('.').next().unwrap_or(namespace);
     let (_, _, plugin) = super::generate_parts(
         schema_namespace,
@@ -74,7 +78,7 @@ private extern class XidlBytesNative {
             .to_owned(),
         ));
     }
-    if let Some(file) = file {
+    if let Ok(file) = file {
         for item in file.items {
             match item {
                 Item::Enum(item) => {

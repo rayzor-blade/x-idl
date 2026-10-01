@@ -13,4 +13,4 @@ quote = "1"
 proc-macro2 = "1"
 # The WebIDL parser the wire generator reads the whole IDL with.
 weedle2 = "5"
-wgpu-types = "30"
+rand = "0.8.4"

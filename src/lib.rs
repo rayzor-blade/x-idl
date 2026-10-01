@@ -1189,14 +1189,19 @@ fn generate_parts(
     ident(namespace)?;
     let mut backend_fns: Vec<BackendFn> = Vec::new();
     let mut described = Vec::new();
-    let file = declaration
-        .map(|path| syn::parse_file(path.to_str().unwrap()))
-        .transpose()
-        .map_err(|e| e.to_string())?;
+    let desc_content = if let Some(path) = &declaration {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())?
+    } else {
+        String::new()
+    };
+
+    let file = syn::parse_file(&desc_content);
+   
     let idl = tokens(webidl)?;
     let aliases = typedefs(&idl);
 
-    let classes: HashSet<_> = if let Some(file) = &file {
+
+    let classes: HashSet<_> = if let Ok(file) = &file {
         file.items
             .iter()
             .filter_map(|i| match i {
@@ -1208,7 +1213,7 @@ fn generate_parts(
     } else {
         HashSet::new()
     };
-    let resources: HashSet<_> = if let Some(file) = &file {
+    let resources: HashSet<_> = if let Ok(file) = &file {
         file.items
             .iter()
             .filter_map(|i| match i {
@@ -1219,7 +1224,7 @@ fn generate_parts(
     } else {
         HashSet::new()
     };
-    let records: HashSet<_> = if let Some(file) = &file {
+    let records: HashSet<_> = if let Ok(file) = &file {
         file.items
             .iter()
             .filter_map(|i| match i {
@@ -1235,7 +1240,7 @@ fn generate_parts(
     // value. Each variant holds exactly one declared type.
     let mut unions: HashMap<String, Vec<(syn::Ident, Type)>> = HashMap::new();
     let mut union_extensions: HashSet<(String, String)> = HashSet::new();
-    if let Some(file) = &file {
+    if let Ok(file) = &file {
         for item in &file.items {
             let Item::Enum(e) = item else { continue };
             if e.variants
@@ -1267,7 +1272,7 @@ fn generate_parts(
         }
     }
 
-    let enums: HashSet<_> = if let Some(file) = &file {
+    let enums: HashSet<_> = if let Ok(file) = &file {
         file.items
             .iter()
             .filter_map(|i| match i {
@@ -1281,7 +1286,7 @@ fn generate_parts(
         HashSet::new()
     };
     let mut idl_types = HashMap::new();
-    if let Some(file) = &file {
+    if let Ok(file) = &file {
         for item in &file.items {
             let (attrs, ty): (&[syn::Attribute], Type) = match item {
                 Item::Enum(item) if unions.contains_key(&item.ident.to_string()) => {
@@ -1312,7 +1317,7 @@ fn generate_parts(
     let mut names = HashSet::new();
     let mut output = TokenStream::new();
     let mut exports = TokenStream::new();
-    if let Some(file) = &file {
+    if let Ok(file) = &file {
         for item in &file.items {
             let name = match &item {
                 Item::Enum(e) => &e.ident,
@@ -2101,11 +2106,13 @@ fn generate_parts(
         idl_types,
         resources,
     };
+
     let output = if target == RustTarget::Caribou {
         quote!(#output caribou_abi::plugin! { name: #namespace; #exports })
     } else {
         output
     };
+
     Ok((output.to_string(), backend_fns, plugin))
 }
 
@@ -2200,9 +2207,9 @@ fn web_backend_for(
 mod test {
     use std::{env::temp_dir, path::PathBuf};
 
-use crate::{enum_values, tokens, pascal, generate};
+    use crate::{enum_values, generate, pascal, tokens};
 
-        #[test]
+    #[test]
     fn webidl_comments_and_spacing_do_not_change_enum_values() {
         let idl = tokens(
             r#"// enum E { "wrong" };
@@ -2218,21 +2225,29 @@ use crate::{enum_values, tokens, pascal, generate};
         assert!(tokens("/* unterminated").is_err());
     }
 
-    fn make_declaration(content:&str) -> Option<PathBuf> {
+    fn make_declaration(content: &str) -> Option<PathBuf> {
         let dir = temp_dir();
-        let path = dir.join("declaration.rs");
-        std::fs::write(&path, content).unwrap();
+        // random suffix to avoid collisions with other tests
+        let suffix = rand::random::<u32>();
+        let path = dir.join(format!("declaration_{suffix}.rs"));
+        std::fs::write(&path, content).expect("expected to make declaration file");
         Some(path)
     }
 
     #[test]
     fn readonly_interface_attributes_can_generate_a_catalog_enum() {
+          let idl = r#"
+          typedef (GPUSampler or GPUBuffer or GPUBufferBinding or GPUExternalTexture) GPUResource;
+          dictionary GPUBufferBinding { required GPUBuffer buffer; unsigned long long size; };
+          interface GPUSupportedLimits { readonly attribute unsigned long maxTextureDimension1D; readonly attribute unsigned long long maxBufferSize; };
+        "#;
         let generated = generate(
             "gpu",
             make_declaration(r#"#[idl("GPUSupportedLimits")] enum Limit {}"#),
-            "interface GPUSupportedLimits { readonly attribute unsigned long maxTextureDimension1D; readonly attribute unsigned long long maxBufferSize; };",
+            idl,
         )
         .unwrap();
+        println!("generated code:\n{generated}");
         assert!(generated.contains("MaxTextureDimension1D"));
         assert!(generated.contains("MaxBufferSize"));
     }
@@ -2266,13 +2281,15 @@ use crate::{enum_values, tokens, pascal, generate};
     fn promise_operations_map_to_the_shared_future_carrier() {
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               trait Queue {
                 #[native(done)]
                 #[idl("GPUQueue.onSubmittedWorkDone")]
                 fn done(this: &Queue) -> Future<()>;
               }
-            "#),
+            "#,
+            ),
             "interface GPUQueue { Promise<undefined> onSubmittedWorkDone(); };",
         )
         .unwrap();
@@ -2280,13 +2297,15 @@ use crate::{enum_values, tokens, pascal, generate};
 
         let wrong = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               trait Queue {
                 #[native(done)]
                 #[idl("GPUQueue.onSubmittedWorkDone")]
                 fn done(this: &Queue) -> i32;
               }
-            "#),
+            "#,
+            ),
             "interface GPUQueue { Promise<undefined> onSubmittedWorkDone(); };",
         );
         assert!(wrong.is_err());
@@ -2295,7 +2314,8 @@ use crate::{enum_values, tokens, pascal, generate};
     fn records_generate_required_optional_and_sequence_fields() {
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               enum Format { Rgba }
               struct Entry { slot: i32 }
               struct Descriptor {
@@ -2309,7 +2329,8 @@ use crate::{enum_values, tokens, pascal, generate};
               trait Device {
                 #[native(create)] fn create(this: &Device, descriptor: &Descriptor);
               }
-            "#),
+            "#,
+            ),
             "",
         )
         .unwrap();
@@ -2330,11 +2351,13 @@ use crate::{enum_values, tokens, pascal, generate};
     fn idl_records_import_inheritance_typedefs_defaults_and_sequences() {
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               #[idl("GPUFormat")] enum Format {}
               #[idl("GPUExtent")] struct Extent {}
               #[idl("GPUDescriptor")] struct Descriptor { extent: Extent }
-            "#),
+            "#,
+            ),
             r#"
               enum GPUFormat { "rgba", "depth" };
               dictionary GPUBase { DOMString label = ""; };
@@ -2375,10 +2398,12 @@ use crate::{enum_values, tokens, pascal, generate};
     fn keyword_members_keep_their_webidl_names() {
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               #[idl("GPUBindingType")] enum BindingType {}
               #[idl("GPULayout")] struct Layout {}
-            "#),
+            "#,
+            ),
             r#"
               enum GPUBindingType { "uniform", "storage" };
               dictionary GPULayout { GPUBindingType type = "uniform"; sequence<long> match = []; };
@@ -2400,7 +2425,8 @@ use crate::{enum_values, tokens, pascal, generate};
         "#;
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               #[idl("GPUSampler")] trait Sampler {}
               #[idl("GPUBuffer")] trait GpuBuffer {}
               #[idl("GPUBufferBinding")] struct BufferBinding {}
@@ -2408,7 +2434,8 @@ use crate::{enum_values, tokens, pascal, generate};
               enum Resource { Sampler(Sampler), Buffer(GpuBuffer), Binding(BufferBinding) }
               #[idl("GPUEntry")] struct Entry {}
               #[idl("GPUGroup")] struct Group {}
-            "#),
+            "#,
+            ),
             idl,
         )
         .unwrap();
@@ -2429,21 +2456,24 @@ use crate::{enum_values, tokens, pascal, generate};
 
         let not_an_alternative = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               trait Queue {}
               #[idl("GPUSampler")] trait Sampler {}
               #[idl("GPUResource")] enum Resource { Sampler(Sampler), Queue(Queue) }
-            "#),
+            "#,
+            ),
             idl,
         );
         assert!(not_an_alternative.is_err());
     }
- 
+
     #[test]
     fn extensions_add_members_the_webidl_lacks() {
         let generated = generate(
             "gpu",
-            make_declaration(r#"
+            make_declaration(
+                r#"
               #[idl("GPUMode")] enum Mode { #[extension] Border }
               trait Array {}
               #[idl("GPUSampler")] trait Sampler {}
@@ -2455,7 +2485,8 @@ use crate::{enum_values, tokens, pascal, generate};
               }
               mod Statistic { const VERTEX: i32 = 1; const FRAGMENT: i32 = 4; }
               #[idl("GPUStage")] mod Stage { const EXTRA: i32 = 8; }
-            "#),
+            "#,
+            ),
             r#"
               enum GPUMode { "clamp", "repeat" };
               typedef (GPUSampler or GPUBuffer) GPUResource;
@@ -2464,6 +2495,7 @@ use crate::{enum_values, tokens, pascal, generate};
             "#,
         )
         .unwrap();
+        
         syn::parse_file(&generated).unwrap();
         assert!(generated.contains("pub enum Mode { # [default] Clamp , Repeat , Border }"));
         assert!(generated.contains("Self :: Border => 2"));
@@ -2512,7 +2544,10 @@ use crate::{enum_values, tokens, pascal, generate};
             ),
             ("struct R { new: Option<i32> }", ""),
         ] {
-            assert!(generate("gpu", make_declaration(api), idl).is_err(), "accepted {api}");
+            assert!(
+                generate("gpu", make_declaration(api), idl).is_err(),
+                "accepted {api}"
+            );
         }
     }
 }

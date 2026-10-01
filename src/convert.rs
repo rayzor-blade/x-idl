@@ -21,7 +21,7 @@ use crate::wire;
 use crate::{generic, generic_pair, type_name};
 
 /// Where a record's member came from.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone,  Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     /// The WebIDL dictionary, as it declares it.
     Imported,
@@ -31,6 +31,7 @@ pub(crate) enum Origin {
     Extension,
 }
 
+#[derive(Debug, Clone)]
 /// A record as the plugin declares it.
 pub(crate) struct Record {
     pub class: syn::Ident,
@@ -40,6 +41,7 @@ pub(crate) struct Record {
 }
 
 /// What the plugin declares that a conversion reads.
+#[derive(Debug, Clone)]
 pub(crate) struct Plugin {
     pub records: Vec<Record>,
     /// Each union's variants, and whether a variant is an extension.
