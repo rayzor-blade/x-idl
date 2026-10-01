@@ -721,7 +721,7 @@ pub fn generate_rayzor_with_resources(
         RustTarget::Rayzor,
         &adapter_resources,
     )?;
-    let registration = rayzor_registration(&model)?;
+    let registration = rayzor_registration(namespace, &model)?;
     Ok(format!("{model} {registration}"))
 }
 
@@ -847,7 +847,7 @@ fn rayzor_return(
 /// Describe every generated C export to Rayzor's compiler and return the same
 /// function pointers to its runtime linker. This is derived from the emitted
 /// model so the externs, method table and actual symbols cannot drift apart.
-fn rayzor_registration(model: &str) -> Result<String, String> {
+fn rayzor_registration(namespace: &str, model: &str) -> Result<String, String> {
     let file = syn::parse_file(model).map_err(error)?;
     let mut descriptors = TokenStream::new();
     let mut symbols = TokenStream::new();
@@ -880,7 +880,7 @@ fn rayzor_registration(model: &str) -> Result<String, String> {
                 haxe::snake(&method.sig.ident.unraw().to_string())
             );
             let method_name = method.sig.ident.unraw().to_string();
-            let class_name = format!("rayzor::gpu::{class}");
+            let class_name = format!("{namespace}::{class}");
             let mut params = Vec::new();
             let mut wrapper_params = Vec::new();
             let mut wrapper_args = Vec::new();
