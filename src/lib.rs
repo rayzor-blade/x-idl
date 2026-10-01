@@ -683,7 +683,7 @@ pub fn generate_rayzor(
 }
 
 /// Emit the runtime-neutral model and HashLink primitive resolvers used by
-/// hlwgpu. Resources cross as integer handles, records as GC-finalized native
+/// the plugin. Resources cross as integer handles, records as GC-finalized native
 /// abstracts, and Promise results as Ash Future carriers.
 pub fn generate_hashlink(
     namespace: &str,
@@ -2194,4 +2194,325 @@ fn web_backend_for(
         }
     }
     Ok(out.to_string())
+}
+
+#[cfg(test)]
+mod test {
+    use std::{env::temp_dir, path::PathBuf};
+
+use crate::{enum_values, tokens, pascal, generate};
+
+        #[test]
+    fn webidl_comments_and_spacing_do_not_change_enum_values() {
+        let idl = tokens(
+            r#"// enum E { "wrong" };
+          enum /* { } */ E { "one-minus-src", // comment with "quotes"
+            "two", };
+          enum Elsewhere { "ignored" };
+        "#,
+        )
+        .unwrap();
+        assert_eq!(enum_values(&idl, "E").unwrap(), ["one-minus-src", "two"]);
+        assert_eq!(pascal("one-minus-src"), "OneMinusSrc");
+        assert!(enum_values(&idl, "Missing").is_err());
+        assert!(tokens("/* unterminated").is_err());
+    }
+
+    fn make_declaration(content:&str) -> Option<PathBuf> {
+        let dir = temp_dir();
+        let path = dir.join("declaration.rs");
+        std::fs::write(&path, content).unwrap();
+        Some(path)
+    }
+
+    #[test]
+    fn readonly_interface_attributes_can_generate_a_catalog_enum() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"#[idl("GPUSupportedLimits")] enum Limit {}"#),
+            "interface GPUSupportedLimits { readonly attribute unsigned long maxTextureDimension1D; readonly attribute unsigned long long maxBufferSize; };",
+        )
+        .unwrap();
+        assert!(generated.contains("MaxTextureDimension1D"));
+        assert!(generated.contains("MaxBufferSize"));
+    }
+    #[test]
+    fn generated_code_contains_typed_objects_and_no_foreign_string_abi() {
+        let generated = generate("gpu", make_declaration(r#"
+          #[idl("Power")] enum Power {}
+          #[idl("Usage")] mod Usage {}
+          trait Device {
+            #[native(create)] fn new() -> Box<Device>;
+            #[native(shader)] fn shader(this: &Device, source: Text, data: Buffer, power: Enum<Power>) -> Box<Shader>;
+          }
+          trait Shader { #[native(name)] fn name(this: &Shader) -> Text; }
+          trait Work { #[native(done)] fn done(this: &Work) -> Future; }
+        "#), r#"enum Power { "low-power", "high-performance" }; namespace Usage { const Flags COPY = 0x4; };"#).unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("gpu.Power"));
+        assert!(generated.contains(
+            "backend :: shader (this . handle , source , data , power . get () . native ())"
+        ));
+        assert!(generated.contains("Box :: new (Shader :: from_handle (value))"));
+        assert!(
+            generated.contains(
+                "fn shader (& Device , Text , Buffer , Enum < Power >) -> Box < Shader >"
+            )
+        );
+        assert!(!generated.contains("wgpu.Power"));
+        assert!(generated.contains("fn done (& Work) -> Future"));
+    }
+    #[test]
+    fn promise_operations_map_to_the_shared_future_carrier() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              trait Queue {
+                #[native(done)]
+                #[idl("GPUQueue.onSubmittedWorkDone")]
+                fn done(this: &Queue) -> Future<()>;
+              }
+            "#),
+            "interface GPUQueue { Promise<undefined> onSubmittedWorkDone(); };",
+        )
+        .unwrap();
+        assert!(generated.contains("fn done (& Queue) -> Future < () >"));
+
+        let wrong = generate(
+            "gpu",
+            make_declaration(r#"
+              trait Queue {
+                #[native(done)]
+                #[idl("GPUQueue.onSubmittedWorkDone")]
+                fn done(this: &Queue) -> i32;
+              }
+            "#),
+            "interface GPUQueue { Promise<undefined> onSubmittedWorkDone(); };",
+        );
+        assert!(wrong.is_err());
+    }
+    #[test]
+    fn records_generate_required_optional_and_sequence_fields() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              enum Format { Rgba }
+              struct Entry { slot: i32 }
+              struct Descriptor {
+                size: i64,
+                label: Option<Text>,
+                format: Option<Enum<Format>>,
+                buffer: Option<BufferResource>,
+                entries: Vec<Entry>,
+              }
+              trait BufferResource {}
+              trait Device {
+                #[native(create)] fn create(this: &Device, descriptor: &Descriptor);
+              }
+            "#),
+            "",
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("pub (crate) size : i64"));
+        assert!(
+            generated.contains("pub (crate) label : Option < caribou_abi :: Rooted < Text > >")
+        );
+        assert!(generated.contains("pub (crate) format : Option < i32 >"));
+        assert!(generated.contains("pub (crate) buffer : Option < i32 >"));
+        assert!(generated.contains("pub (crate) entries : Vec < Entry >"));
+        assert!(generated.contains("fn new (size : i64) -> Box < Descriptor >"));
+        assert!(generated.contains("fn label (& mut Descriptor , Text)"));
+        assert!(generated.contains("fn addEntries (& mut Descriptor , & Entry)"));
+        assert!(generated.contains("backend :: create (this . handle , descriptor)"));
+    }
+    #[test]
+    fn idl_records_import_inheritance_typedefs_defaults_and_sequences() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              #[idl("GPUFormat")] enum Format {}
+              #[idl("GPUExtent")] struct Extent {}
+              #[idl("GPUDescriptor")] struct Descriptor { extent: Extent }
+            "#),
+            r#"
+              enum GPUFormat { "rgba", "depth" };
+              dictionary GPUBase { DOMString label = ""; };
+              typedef [EnforceRange] unsigned long long GPUSize;
+              dictionary GPUExtent { required unsigned long width; };
+              typedef (sequence<unsigned long> or GPUExtent) GPUExtentUnion;
+              dictionary GPUDescriptor : GPUBase {
+                required GPUSize size;
+                required GPUExtentUnion extent;
+                boolean enabled = false;
+                sequence<GPUFormat> formats = [];
+                record<DOMString, (GPUSize or undefined)> limits = {};
+                sequence<GPUExtent?> layouts = [];
+              };
+            "#,
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(
+            generated.contains("pub (crate) label : Option < caribou_abi :: Rooted < Text > >")
+        );
+        assert!(generated.contains("pub (crate) size : i64"));
+        assert!(generated.contains("pub (crate) extent : Extent"));
+        assert!(generated.contains("pub (crate) enabled : Option < bool >"));
+        assert!(generated.contains("pub (crate) formats : Vec < i32 >"));
+        assert!(
+            generated
+                .contains("pub (crate) limits : Vec < (caribou_abi :: Rooted < Text > , i64) >")
+        );
+        assert!(generated.contains("pub (crate) layouts : Vec < Option < Extent >>"));
+        assert!(generated.contains("fn new (i64 , & Extent) -> Box < Descriptor >"));
+        assert!(generated.contains("fn addFormats (& mut Descriptor , Enum < Format >)"));
+        assert!(generated.contains("fn addLimits (& mut Descriptor , Text , i64)"));
+        assert!(generated.contains("fn addLayouts (& mut Descriptor , & Extent)"));
+        assert!(generated.contains("fn addLayoutsNull (& mut Descriptor)"));
+    }
+    #[test]
+    fn keyword_members_keep_their_webidl_names() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              #[idl("GPUBindingType")] enum BindingType {}
+              #[idl("GPULayout")] struct Layout {}
+            "#),
+            r#"
+              enum GPUBindingType { "uniform", "storage" };
+              dictionary GPULayout { GPUBindingType type = "uniform"; sequence<long> match = []; };
+            "#,
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("pub (crate) r#type : Option < i32 >"));
+        assert!(generated.contains("fn r#type (& mut Layout , Enum < BindingType >)"));
+        assert!(generated.contains("fn addMatch (& mut Layout , i32)"));
+    }
+    #[test]
+    fn declared_unions_take_one_setter_per_alternative() {
+        let idl = r#"
+          typedef (GPUSampler or GPUBuffer or GPUBufferBinding or GPUExternalTexture) GPUResource;
+          dictionary GPUBufferBinding { required GPUBuffer buffer; unsigned long long size; };
+          dictionary GPUEntry { required unsigned long binding; required GPUResource resource; };
+          dictionary GPUGroup { sequence<GPUResource> extras = []; };
+        "#;
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              #[idl("GPUSampler")] trait Sampler {}
+              #[idl("GPUBuffer")] trait GpuBuffer {}
+              #[idl("GPUBufferBinding")] struct BufferBinding {}
+              #[idl("GPUResource")]
+              enum Resource { Sampler(Sampler), Buffer(GpuBuffer), Binding(BufferBinding) }
+              #[idl("GPUEntry")] struct Entry {}
+              #[idl("GPUGroup")] struct Group {}
+            "#),
+            idl,
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains(
+            "pub enum Resource { Sampler (i32) , Buffer (i32) , Binding (BufferBinding) }"
+        ));
+        assert!(generated.contains("pub (crate) resource : Option < Resource >"));
+        assert!(generated.contains("fn new (i32) -> Box < Entry >"));
+        assert!(generated.contains("fn resourceSampler (& mut Entry , & Sampler)"));
+        assert!(generated.contains("fn resourceBinding (& mut Entry , & BufferBinding)"));
+        assert!(generated.contains("this . resource = Some (Resource :: Buffer (value . handle))"));
+        assert!(generated.contains("fn addExtrasBuffer (& mut Group , & GpuBuffer)"));
+        assert!(
+            !generated.contains("class Resource"),
+            "a union is not a Caribou class"
+        );
+
+        let not_an_alternative = generate(
+            "gpu",
+            make_declaration(r#"
+              trait Queue {}
+              #[idl("GPUSampler")] trait Sampler {}
+              #[idl("GPUResource")] enum Resource { Sampler(Sampler), Queue(Queue) }
+            "#),
+            idl,
+        );
+        assert!(not_an_alternative.is_err());
+    }
+ 
+    #[test]
+    fn extensions_add_members_the_webidl_lacks() {
+        let generated = generate(
+            "gpu",
+            make_declaration(r#"
+              #[idl("GPUMode")] enum Mode { #[extension] Border }
+              trait Array {}
+              #[idl("GPUSampler")] trait Sampler {}
+              #[idl("GPUResource")]
+              enum Resource { Sampler(Sampler), #[extension] Array(Array) }
+              #[idl("GPUDescriptor")] struct Descriptor {
+                  /// Not in WebIDL.
+                  #[extension] count: Option<i32>,
+              }
+              mod Statistic { const VERTEX: i32 = 1; const FRAGMENT: i32 = 4; }
+              #[idl("GPUStage")] mod Stage { const EXTRA: i32 = 8; }
+            "#),
+            r#"
+              enum GPUMode { "clamp", "repeat" };
+              typedef (GPUSampler or GPUBuffer) GPUResource;
+              dictionary GPUDescriptor { required GPUResource resource; };
+              namespace GPUStage { const GPUFlags VERTEX = 0x1; };
+            "#,
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("pub enum Mode { # [default] Clamp , Repeat , Border }"));
+        assert!(generated.contains("Self :: Border => 2"));
+        assert!(generated.contains("fn resourceArray (& mut Descriptor , & Array)"));
+        assert!(generated.contains("fn count (& mut Descriptor , i32)"));
+        assert!(generated.contains("fn FRAGMENT () -> i32"));
+        assert!(generated.contains("fn VERTEX () -> i32"));
+        assert!(generated.contains("fn EXTRA () -> i32"));
+        assert!(
+            generate("gpu", make_declaration("enum E { A, #[extension] B }"), "").is_err(),
+            "an extension needs WebIDL values to extend"
+        );
+    }
+    #[test]
+    fn a_static_function_can_take_a_record_first() {
+        let api = r#"
+          struct Options { level: Option<i32> }
+          trait Device {
+              #[native(create_with)] fn createWith(options: &Options) -> Box<Device>;
+          }
+          trait Other {}
+        "#;
+        let generated = generate("gpu", make_declaration(api), "").unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("fn createWith (& Options) -> Box < Device >"));
+        let foreign = api.replace("options: &Options", "other: &Other");
+        assert!(
+            generate("gpu", make_declaration(&foreign), "").is_err(),
+            "a resource first must be the receiver"
+        );
+    }
+    #[test]
+    fn ambiguous_and_unsupported_declarations_fail_generation() {
+        for (api, idl) in [
+            ("#[idl(\"E\")] enum E {}", "enum E { \"a-b\", \"a--b\" };"),
+            ("enum E {}", ""),
+            ("trait R { fn call(this: &R); }", ""),
+            ("trait R { #[native(call)] fn call(bytes: *mut u8); }", ""),
+            (
+                "trait R { #[native(call)] fn call(this: &R) -> Box<Missing>; }",
+                "",
+            ),
+            (
+                "#[idl(\"E\")] enum E {}",
+                "enum E { \"a\" }; enum E { \"b\" };",
+            ),
+            ("struct R { new: Option<i32> }", ""),
+        ] {
+            assert!(generate("gpu", make_declaration(api), idl).is_err(), "accepted {api}");
+        }
+    }
 }
