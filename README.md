@@ -1,0 +1,1 @@
+# IDL-based native bindings generator for Ash, Rayzor and Caribou runtimes
