@@ -2485,6 +2485,10 @@ fn generate_parts(
                         let mut args = Vec::new();
                         let mut backend_types = Vec::new();
                         let mut declared = Vec::new();
+                        // Whether an argument is an optional enum, which a
+                        // runtime other than Caribou takes as its native
+                        // value, `i32::MIN` for none, through `<name>Native`.
+                        let mut lowered = false;
                         for (i, arg) in f.sig.inputs.iter().enumerate() {
                             let FnArg::Typed(arg) = arg else {
                                 return Err("use an explicit this: &Class receiver".into());
@@ -2494,6 +2498,7 @@ fn generate_parts(
                             };
                             let param = &pat.ident;
                             let ty = &arg.ty;
+                            let mut abi = quote!(#ty);
                             let value = if let Type::Reference(r) = &**ty {
                                 let target =
                                     type_name(&r.elem).ok_or("invalid object reference")?;
@@ -2520,17 +2525,42 @@ fn generate_parts(
                                 }
                                 backend_types.push(quote!(i32));
                                 quote!(#param.get().native())
+                            } else if let Some(e) =
+                                generic(ty, "Option").and_then(|o| generic(&o, "Enum"))
+                            {
+                                if !enums.contains(&type_name(&e).unwrap_or_default()) {
+                                    return Err("unknown enum".into());
+                                }
+                                backend_types.push(quote!(Option<i32>));
+                                if target == RustTarget::Caribou {
+                                    quote!(#param.map(|v| v.get().native()))
+                                } else {
+                                    lowered = true;
+                                    abi = quote!(i32);
+                                    quote!((#param != i32::MIN).then_some(#param))
+                                }
                             } else if scalar(ty) {
                                 backend_types.push(quote!(#ty));
                                 quote!(#param)
                             } else {
                                 return Err(format!("unsupported argument type in {class}.{name}"));
                             };
-                            params.push(quote!(#param: #ty));
-                            types.push(quote!(#ty));
+                            params.push(quote!(#param: #abi));
+                            types.push(abi);
                             args.push(value);
                             declared.push((**ty).clone());
                         }
+                        let name = &if lowered {
+                            let native = ident(&format!("{}Native", name.unraw()))?;
+                            if !names.insert(native.to_string()) {
+                                return Err(format!(
+                                    "generated method {class}.{native} is duplicated"
+                                ));
+                            }
+                            native
+                        } else {
+                            name.clone()
+                        };
                         // A panic in the backend becomes a runtime error in the
                         // caller's language, and the fallback is returned.
                         let call = quote! {
@@ -2555,6 +2585,11 @@ fn generate_parts(
                         if let ReturnType::Type(_, ty) = &f.sig.output
                             && type_name(ty).is_some_and(|n| variants.contains_key(&n))
                         {
+                            if lowered {
+                                return Err(format!(
+                                    "{class}.{name} returns variants, so it cannot take an optional enum"
+                                ));
+                            }
                             if !backend_fns.iter().any(|b| b.name == native) {
                                 backend_fns.push(BackendFn {
                                     name: native.clone(),
@@ -2919,6 +2954,67 @@ mod test {
     use crate::{
         enum_values, generate, generate_hashlink, generate_rayzor, pascal, tokens, web_backend,
     };
+
+    #[test]
+    fn an_optional_enum_argument_crosses_as_its_value_or_none() {
+        let api = r#"
+            enum Theme { Light, Dark }
+            trait Window {
+                #[native(window_set_theme)] fn setTheme(this: &Window, theme: Option<Enum<Theme>>);
+            }
+        "#;
+        let library = crate::Library("window");
+        // HashLink and Rayzor take the native value, i32::MIN for none,
+        // through `setThemeNative`.
+        for model in [
+            library.generate_hashlink("window", api, "").unwrap(),
+            library.generate_rayzor("window", api, "", &[]).unwrap(),
+        ] {
+            let flat = model.replace(' ', "");
+            assert!(
+                flat.contains("pubextern\"C\"fnsetThemeNative(this:&Window,theme:i32)"),
+                "{model}"
+            );
+            assert!(
+                flat.contains(
+                    "backend::window_set_theme(this.handle,(theme!=i32::MIN).then_some(theme))"
+                ),
+                "{model}"
+            );
+        }
+        // Caribou takes the option itself.
+        let caribou = crate::generate_caribou("window", api, "")
+            .unwrap()
+            .replace(' ', "");
+        assert!(
+            caribou.contains("fnsetTheme(this:&Window,theme:Option<Enum<Theme>>)"),
+            "{caribou}"
+        );
+        assert!(
+            caribou.contains("theme.map(|v|v.get().native())"),
+            "{caribou}"
+        );
+        for runtime in [crate::haxe::Runtime::HashLink, crate::haxe::Runtime::Rayzor] {
+            let files = library.haxe("window", api, "", runtime).unwrap();
+            let window = &files
+                .iter()
+                .find(|f| f.path == "window/Window.hx")
+                .unwrap()
+                .source;
+            assert!(
+                window.contains("inline function setTheme(theme:Null<Theme>):Void"),
+                "{window}"
+            );
+            assert!(window.contains("setThemeNative("), "{window}");
+            assert!(
+                window.contains("(theme == null ? 0x80000000 : (theme : Int))"),
+                "{window}"
+            );
+            // HashLink's symbol is `window_set_theme_native` in library
+            // `window`; Rayzor's carries the library, `window_window_...`.
+            assert!(window.contains("window_set_theme_native\")"), "{window}");
+        }
+    }
 
     #[test]
     fn rayzor_methods_name_classes_as_the_externs_do() {

@@ -298,6 +298,7 @@ private extern class XidlBytesNative {
                         };
                         let rust_name = method.sig.ident.to_string();
                         let mut args = Vec::new();
+                        let mut typed = Vec::new();
                         let mut instance = false;
                         for (at, arg) in method.sig.inputs.iter().enumerate() {
                             let FnArg::Typed(arg) = arg else { continue };
@@ -312,6 +313,7 @@ private extern class XidlBytesNative {
                                 continue;
                             }
                             args.push(format!("{}:{}", param.ident, hx_type(&arg.ty, runtime)?));
+                            typed.push((param.ident.to_string(), (*arg.ty).clone()));
                         }
                         let ret = match &method.sig.output {
                             ReturnType::Default => "Void".to_owned(),
@@ -348,6 +350,26 @@ private extern class XidlBytesNative {
                             let names = arg_names(&args);
                             methods.push(format!(
                                 "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\treturn read{variants_name}({index}({names}));\n\t}}",
+                                args.join(", ")
+                            ));
+                            continue;
+                        }
+                        if let Some((native_args, call_args)) = lowered(&typed, runtime)? {
+                            // An optional enum crosses as its value; the
+                            // public method passes none as NONE.
+                            let lowered_name = format!("{rust_name}Native");
+                            methods.push(format!(
+                                "\t{}\n\tprivate {static_}function {lowered_name}({native_args}):{ret};",
+                                native(library, runtime, &name, &lowered_name),
+                            ));
+                            let call = format!("{lowered_name}({call_args})");
+                            let body = if ret == "Void" {
+                                call
+                            } else {
+                                format!("return {call}")
+                            };
+                            methods.push(format!(
+                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\t{body};\n\t}}",
                                 args.join(", ")
                             ));
                             continue;
@@ -575,14 +597,33 @@ fn hashlink_resource(
         } else {
             args.clone()
         };
+        // An optional enum crosses as its value; the public method passes
+        // none as NONE.
+        let lowered = lowered(&params, Runtime::HashLink)?;
+        let (native_args, names, native_name) = match &lowered {
+            Some((args, names)) => (
+                if instance {
+                    if args.is_empty() {
+                        "self:Int".to_owned()
+                    } else {
+                        format!("self:Int, {args}")
+                    }
+                } else {
+                    args.clone()
+                },
+                names.clone(),
+                format!("{rust_name}Native"),
+            ),
+            None => (native_args, names, rust_name.clone()),
+        };
         let native_method = if rust_name == "new" {
             "create"
         } else {
-            &rust_name
+            &native_name
         };
         native_class.push_str(&format!(
             "\n\t{}\n\tpublic static function {native_method}({native_args}):{native_ret};",
-            native(library, Runtime::HashLink, name, &rust_name),
+            native(library, Runtime::HashLink, name, &native_name),
         ));
         let call_args = if instance {
             if names.is_empty() {
@@ -735,6 +776,31 @@ impl<'a> Reader<'a> {
             values[0]
         )
     }
+}
+
+/// What an optional enum argument stands for when it is none: `i32::MIN`,
+/// which no declared enum value is.
+const NONE: &str = "0x80000000";
+
+/// For a method taking an optional enum: its native's parameters, the enum
+/// as its value, and the call's arguments, none as `NONE`.
+fn lowered(args: &[(String, Type)], runtime: Runtime) -> Result<Option<(String, String)>, String> {
+    let optional = |ty: &Type| one(ty, "Option").is_some_and(|inner| one(&inner, "Enum").is_some());
+    if !args.iter().any(|(_, ty)| optional(ty)) {
+        return Ok(None);
+    }
+    let mut native = Vec::new();
+    let mut call = Vec::new();
+    for (name, ty) in args {
+        if optional(ty) {
+            native.push(format!("{name}:Int"));
+            call.push(format!("({name} == null ? {NONE} : ({name} : Int))"));
+        } else {
+            native.push(format!("{name}:{}", hx_type(ty, runtime)?));
+            call.push(name.clone());
+        }
+    }
+    Ok(Some((native.join(", "), call.join(", "))))
 }
 
 /// The names in a Haxe parameter list, `a:Int, b:Float` as `a, b`.
