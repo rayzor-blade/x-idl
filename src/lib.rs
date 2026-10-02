@@ -8,7 +8,7 @@ pub mod wire;
 /// Generate complete conventional Haxe surface for one runtime.
 pub fn haxe(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     idl_path: &str,
     runtime: haxe::Runtime,
 ) -> Result<Vec<haxe::File>, String> {
@@ -22,6 +22,51 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use syn::ext::IdentExt;
 use syn::{FnArg, GenericArgument, Item, PathArguments, ReturnType, TraitItem, Type};
+
+/// The declaration a binding is generated from: its text, a file holding
+/// it, or none.
+#[derive(Clone, Debug, Default)]
+pub enum Declaration {
+    #[default]
+    None,
+    Text(String),
+    Path(PathBuf),
+}
+
+impl Declaration {
+    fn text(&self) -> Result<String, String> {
+        match self {
+            Declaration::None => Ok(String::new()),
+            Declaration::Text(text) => Ok(text.clone()),
+            Declaration::Path(path) => std::fs::read_to_string(path)
+                .map_err(|e| format!("reading {}: {e}", path.display())),
+        }
+    }
+}
+
+impl From<&str> for Declaration {
+    fn from(text: &str) -> Self {
+        Declaration::Text(text.to_owned())
+    }
+}
+
+impl From<String> for Declaration {
+    fn from(text: String) -> Self {
+        Declaration::Text(text)
+    }
+}
+
+impl From<PathBuf> for Declaration {
+    fn from(path: PathBuf) -> Self {
+        Declaration::Path(path)
+    }
+}
+
+impl From<Option<PathBuf>> for Declaration {
+    fn from(path: Option<PathBuf>) -> Self {
+        path.map_or(Declaration::None, Declaration::Path)
+    }
+}
 
 fn error(message: impl std::fmt::Display) -> String {
     message.to_string()
@@ -958,12 +1003,12 @@ fn stored_value(
 /// the generated ABI uses typed native objects, enums, Text and Buffer.
 pub fn generate_caribou(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
 ) -> Result<String, String> {
     generate_parts(
         namespace,
-        declaration,
+        &declaration.into(),
         webidl,
         RustTarget::Caribou,
         &HashSet::new(),
@@ -1004,13 +1049,13 @@ impl<'a> Library<'a> {
     pub fn generate_hashlink(
         self,
         namespace: &str,
-        declaration: Option<PathBuf>,
+        declaration: impl Into<Declaration>,
         webidl: &str,
     ) -> Result<String, String> {
         let library = self.name()?;
         let (model, _, plugin) = generate_parts(
             namespace,
-            declaration,
+            &declaration.into(),
             webidl,
             RustTarget::HashLink,
             &HashSet::new(),
@@ -1026,7 +1071,7 @@ impl<'a> Library<'a> {
     pub fn generate_rayzor(
         self,
         namespace: &str,
-        declaration: Option<PathBuf>,
+        declaration: impl Into<Declaration>,
         webidl: &str,
         adapter_resources: &[&str],
     ) -> Result<String, String> {
@@ -1040,7 +1085,7 @@ impl<'a> Library<'a> {
         self,
         namespace: &str,
         package: &str,
-        declaration: Option<PathBuf>,
+        declaration: impl Into<Declaration>,
         webidl: &str,
         adapter_resources: &[&str],
     ) -> Result<String, String> {
@@ -1051,7 +1096,7 @@ impl<'a> Library<'a> {
             .collect();
         let (model, _, _) = generate_parts(
             namespace,
-            declaration,
+            &declaration.into(),
             webidl,
             RustTarget::Rayzor,
             &adapter_resources,
@@ -1065,11 +1110,11 @@ impl<'a> Library<'a> {
     pub fn haxe(
         self,
         namespace: &str,
-        declaration: Option<PathBuf>,
+        declaration: impl Into<Declaration>,
         webidl: &str,
         runtime: haxe::Runtime,
     ) -> Result<Vec<haxe::File>, String> {
-        haxe::generate_in(self.name()?, namespace, declaration, webidl, runtime)
+        haxe::generate_in(self.name()?, namespace, declaration.into(), webidl, runtime)
     }
 }
 
@@ -1078,7 +1123,7 @@ impl<'a> Library<'a> {
 /// and the generic Enum carrier; xidl supplies the object model and backend.
 pub fn generate_rayzor(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
 ) -> Result<String, String> {
     generate_rayzor_with_resources(namespace, declaration, webidl, &[])
@@ -1087,7 +1132,7 @@ pub fn generate_rayzor(
 /// `Library::generate_hashlink` in the `xidl` library.
 pub fn generate_hashlink(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
 ) -> Result<String, String> {
     Library::XIDL.generate_hashlink(namespace, declaration, webidl)
@@ -1097,7 +1142,7 @@ pub fn generate_hashlink(
 pub fn generate_rayzor_in(
     namespace: &str,
     package: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
     adapter_resources: &[&str],
 ) -> Result<String, String> {
@@ -1107,7 +1152,7 @@ pub fn generate_rayzor_in(
 /// `Library::generate_rayzor` in the `xidl` library.
 pub fn generate_rayzor_with_resources(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
     adapter_resources: &[&str],
 ) -> Result<String, String> {
@@ -1117,7 +1162,7 @@ pub fn generate_rayzor_with_resources(
 /// Compatibility spelling for existing Caribou build scripts.
 pub fn generate(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
 ) -> Result<String, String> {
     generate_caribou(namespace, declaration, webidl)
@@ -1629,7 +1674,7 @@ fn hashlink_registration(
 
 fn generate_parts(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: &Declaration,
     webidl: &str,
     target: RustTarget,
     adapter_resources: &HashSet<String>,
@@ -1637,11 +1682,7 @@ fn generate_parts(
     ident(namespace)?;
     let mut backend_fns: Vec<BackendFn> = Vec::new();
     let mut described = Vec::new();
-    let desc_content = if let Some(path) = &declaration {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())?
-    } else {
-        String::new()
-    };
+    let desc_content = declaration.text()?;
 
     let file = syn::parse_file(&desc_content).map_err(error);
     if let Err(e) = &file {
@@ -2781,13 +2822,13 @@ fn generate_parts(
 /// is not available and returns what a failed call returns.
 pub fn web_backend(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
     implemented: &str,
 ) -> Result<String, String> {
     web_backend_for(
         namespace,
-        declaration,
+        declaration.into(),
         webidl,
         implemented,
         RustTarget::Caribou,
@@ -2799,13 +2840,13 @@ pub fn web_backend(
 /// WebGPU implementation and unavailable-operation fallbacks as Caribou.
 pub fn hashlink_web_backend(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<Declaration>,
     webidl: &str,
     implemented: &str,
 ) -> Result<String, String> {
     web_backend_for(
         namespace,
-        declaration,
+        declaration.into(),
         webidl,
         implemented,
         RustTarget::HashLink,
@@ -2814,13 +2855,13 @@ pub fn hashlink_web_backend(
 
 fn web_backend_for(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: Declaration,
     webidl: &str,
     implemented: &str,
     target: RustTarget,
 ) -> Result<String, String> {
     let (_, backend_fns, plugin) =
-        generate_parts(namespace, declaration, webidl, target, &HashSet::new())?;
+        generate_parts(namespace, &declaration, webidl, target, &HashSet::new())?;
     let file = syn::parse_file(implemented).map_err(error)?;
     let defined: HashSet<String> = file
         .items
@@ -2874,7 +2915,6 @@ fn web_backend_for(
 
 #[cfg(test)]
 mod test {
-    use std::{env::temp_dir, path::PathBuf};
 
     use crate::{
         enum_values, generate, generate_hashlink, generate_rayzor, pascal, tokens, web_backend,
@@ -2887,18 +2927,9 @@ mod test {
                 #[native(device_name)] fn name(this: &Device) -> Text;
             }
         "#;
-        let api_path = temp_dir().join(format!("rayzor-package-{}.rs", std::process::id()));
-        std::fs::write(&api_path, api).unwrap();
-        let generated =
-            crate::generate_rayzor_in("gpu", "rayzor.gpu", Some(api_path.clone()), "", &[]).unwrap();
-        let externs = crate::haxe::generate(
-            "rayzor.gpu",
-            Some(api_path.clone()),
-            "",
-            crate::haxe::Runtime::Rayzor,
-        )
-        .unwrap();
-        std::fs::remove_file(api_path).ok();
+        let generated = crate::generate_rayzor_in("gpu", "rayzor.gpu", api, "", &[]).unwrap();
+        let externs =
+            crate::haxe::generate("rayzor.gpu", api, "", crate::haxe::Runtime::Rayzor).unwrap();
         assert!(generated.contains("\"rayzor::gpu::Device\""), "{generated}");
         let device = externs
             .iter()
@@ -2921,11 +2952,7 @@ mod test {
                 #[native(device_name)] fn name(this: &Device) -> Text;
             }
         "#;
-        let api_path = temp_dir().join("rayzor_api.rs");
-
-        std::fs::write(&api_path, api).unwrap();
-
-        let generated = generate_rayzor("gpu", Some(api_path), "").unwrap();
+        let generated = generate_rayzor("gpu", api, "").unwrap();
 
         assert!(!generated.contains("caribou_abi"));
         assert!(!generated.contains("plugin !"));
@@ -2958,13 +2985,8 @@ mod test {
         assert!(tokens("/* unterminated").is_err());
     }
 
-    fn make_declaration(content: &str) -> Option<PathBuf> {
-        let dir = temp_dir();
-        // random suffix to avoid collisions with other tests
-        let suffix = rand::random::<u32>();
-        let path = dir.join(format!("declaration_{suffix}.rs"));
-        std::fs::write(&path, content).expect("expected to make declaration file");
-        Some(path)
+    fn make_declaration(content: &str) -> crate::Declaration {
+        content.into()
     }
 
     #[test]
@@ -3554,11 +3576,9 @@ mod test {
               fn pushErrorScope(this: &Device, filter: i32);
           }
         "#;
-        let declaration_path = temp_dir().join(format!("forward-{}.api.rs", std::process::id()));
-        std::fs::write(&declaration_path, declaration).unwrap();
         // A hand-written function wins over its member.
         let web = "pub fn error_scope_push(device: i32, filter: i32) {}";
-        let generated = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap();
+        let generated = web_backend("gpu", declaration, idl, web).unwrap();
         syn::parse_file(&generated).unwrap();
         let flat = generated.replace(' ', "");
         for expected in [
@@ -3588,8 +3608,7 @@ mod test {
             "fn draw(this: &Bundle, vertices: i32);",
             "fn draw(this: &Bundle, vertices: i32, instances: i32, more: i32);",
         );
-        std::fs::write(&declaration_path, bad).unwrap();
-        let error = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap_err();
+        let error = web_backend("gpu", bad, idl, web).unwrap_err();
         assert!(
             error.contains("Bundle.bundle_draw (GPURenderBundleEncoder.draw) cannot be generated"),
             "{error}"
@@ -3604,13 +3623,11 @@ mod test {
             "fn width(this: &Texture) -> i32;",
             "fn width(this: &Texture) -> Text;",
         );
-        std::fs::write(&declaration_path, wrong).unwrap();
-        let error = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap_err();
+        let error = web_backend("gpu", wrong, idl, web).unwrap_err();
         assert!(
             error.contains("Texture.width: returns Text, but GPUTexture.width maps to i32"),
             "{error}"
         );
-        std::fs::remove_file(declaration_path).ok();
     }
 
     #[test]
@@ -3654,12 +3671,8 @@ mod test {
           #[idl("GPUExtent3DDict")] struct Extent {}
           #[idl("GPUSized")] struct Sized { size: Extent }
         "#;
-        let declaration_path = temp_dir().join("gpu.api.rs");
-        std::fs::write(&declaration_path, declaration)
-            .map_err(|e| format!("failed to write gpu.api.rs: {e}"))
-            .unwrap();
         let web = "pub fn laid_layout() {}";
-        let generated = web_backend("gpu", Some(declaration_path), idl, web).unwrap();
+        let generated = web_backend("gpu", declaration, idl, web).unwrap();
         syn::parse_file(&generated).unwrap();
         let flat = generated.replace(' ', "");
         for expected in [

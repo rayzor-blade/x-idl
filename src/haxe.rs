@@ -2,7 +2,7 @@
 //! Caribou plugin. Runtime-specific annotations and future carriers are the
 //! only differences between targets.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use quote::ToTokens;
 use syn::ext::IdentExt;
@@ -29,33 +29,29 @@ pub struct File {
 /// the `xidl` library.
 pub fn generate(
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: impl Into<crate::Declaration>,
     webidl: &str,
     runtime: Runtime,
 ) -> Result<Vec<File>, String> {
-    generate_in("xidl", namespace, declaration, webidl, runtime)
+    generate_in("xidl", namespace, declaration.into(), webidl, runtime)
 }
 
 /// As `generate`, its natives in `library` (see `crate::Library`).
 pub(crate) fn generate_in(
     library: &str,
     namespace: &str,
-    declaration: Option<PathBuf>,
+    declaration: crate::Declaration,
     webidl: &str,
     runtime: Runtime,
 ) -> Result<Vec<File>, String> {
-    let desc_content = if let Some(path) = &declaration {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())?
-    } else {
-        String::new()
-    };
+    let desc_content = declaration.text()?;
 
     let file = syn::parse_file(&desc_content);
 
     let schema_namespace = namespace.rsplit('.').next().unwrap_or(namespace);
     let (_, _, plugin) = super::generate_parts(
         schema_namespace,
-        declaration,
+        &declaration,
         webidl,
         super::RustTarget::Caribou,
         &std::collections::HashSet::new(),
