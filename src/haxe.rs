@@ -294,6 +294,8 @@ private extern class XidlBytesNative {
                         continue;
                     }
                     let mut methods = Vec::new();
+                    // The variants types whose readers this class has.
+                    let mut kept = std::collections::HashSet::new();
                     for entry in item.items {
                         let TraitItem::Fn(method) = entry else {
                             continue;
@@ -320,8 +322,7 @@ private extern class XidlBytesNative {
                             ReturnType::Type(_, ty) => hx_type(ty, runtime)?,
                         };
                         let static_ = if instance { "" } else { "static " };
-                        if let Some((variants_name, declared)) =
-                            returned_variants(&method.sig.output, &plugin)
+                        if let Some(variants_name) = returned_variants(&method.sig.output, &plugin)
                         {
                             // The value is built here from its variant's index
                             // and the fields the natives read back.
@@ -331,27 +332,26 @@ private extern class XidlBytesNative {
                                 native(library, runtime, &name, &index),
                                 args.join(", ")
                             ));
-                            for (variant, fields) in declared {
-                                for (field, ty) in fields {
-                                    let getter =
-                                        super::variant_getter(&method.sig.ident, variant, field);
+                            if kept.insert(variants_name.clone()) {
+                                let call = |getter: &str| format!("{getter}()");
+                                let leaf = |value: String, _: &Type| value;
+                                let mut reader = Reader::new(&plugin, &call, &leaf);
+                                reader.read(&variants_name);
+                                for (getter, ty) in &reader.natives {
+                                    let ty = match ty {
+                                        Some(ty) => hx_type(ty, runtime)?,
+                                        None => "Int".to_owned(),
+                                    };
                                     methods.push(format!(
-                                        "\t{}\n\tprivate static function {getter}():{};",
-                                        native(library, runtime, &name, &getter),
-                                        hx_type(ty, runtime)?
+                                        "\t{}\n\tprivate static function {getter}():{ty};",
+                                        native(library, runtime, &name, getter),
                                     ));
                                 }
+                                methods.extend(reader.helpers);
                             }
                             let names = arg_names(&args);
-                            let switch = variant_switch(
-                                &variants_name,
-                                declared,
-                                &method.sig.ident,
-                                &format!("{index}({names})"),
-                                |getter, _| format!("{getter}()"),
-                            );
                             methods.push(format!(
-                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n{switch}\t}}",
+                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\treturn read{variants_name}({index}({names}));\n\t}}",
                                 args.join(", ")
                             ));
                             continue;
@@ -476,6 +476,8 @@ fn hashlink_resource(
     let mut public = format!("abstract {name}(Int) from Int to Int {{");
     let mut native_class = format!("private extern class {name}Native {{");
     let mut text_getters = false;
+    // The variants types whose readers this class has.
+    let mut kept = std::collections::HashSet::new();
     for entry in &item.items {
         let TraitItem::Fn(method) = entry else {
             continue;
@@ -506,7 +508,7 @@ fn hashlink_resource(
             ReturnType::Type(_, ty) => (**ty).clone(),
         };
         let ret = hx_type(&ret_ty, Runtime::HashLink)?;
-        if let Some((variants_name, declared)) = returned_variants(&method.sig.output, plugin) {
+        if let Some(variants_name) = returned_variants(&method.sig.output, plugin) {
             let index = format!("{rust_name}Variant");
             let native_args = if instance {
                 if args.is_empty() {
@@ -521,40 +523,45 @@ fn hashlink_resource(
                 "\n\t{}\n\tpublic static function {index}({native_args}):Int;",
                 native(library, Runtime::HashLink, name, &index),
             ));
-            for (variant, fields) in declared {
-                for (field, ty) in fields {
-                    let getter = super::variant_getter(&method.sig.ident, variant, field);
-                    let native_ty = match simple_name(ty).as_deref() {
-                        Some("Text") => {
-                            text_getters = true;
-                            "hl.Bytes".to_owned()
-                        }
-                        _ => hx_type(ty, Runtime::HashLink)?,
-                    };
-                    native_class.push_str(&format!(
-                        "\n\t{}\n\tpublic static function {getter}():{native_ty};",
-                        native(library, Runtime::HashLink, name, &getter),
-                    ));
-                }
-            }
             let call_args = match (instance, names.is_empty()) {
                 (true, true) => "this".to_owned(),
                 (true, false) => format!("this, {names}"),
                 (false, _) => names.clone(),
             };
-            let switch = variant_switch(
-                &variants_name,
-                declared,
-                &method.sig.ident,
-                &format!("{name}Native.{index}({call_args})"),
-                |getter, ty| match simple_name(ty).as_deref() {
-                    Some("Text") => format!("text({name}Native.{getter}())"),
-                    _ => format!("{name}Native.{getter}()"),
-                },
-            );
+            if kept.insert(variants_name.clone()) {
+                let call = |getter: &str| format!("{name}Native.{getter}()");
+                let leaf = |value: String, ty: &Type| match simple_name(ty).as_deref() {
+                    Some("Text") => format!("text({value})"),
+                    Some("Buffer") => format!("XidlBytes.take({value})"),
+                    _ => value,
+                };
+                let mut reader = Reader::new(plugin, &call, &leaf);
+                reader.read(&variants_name);
+                for (getter, ty) in &reader.natives {
+                    let native_ty = match ty.as_ref().map(|ty| (simple_name(ty), ty)) {
+                        None => "Int".to_owned(),
+                        Some((Some(n), _)) if n == "Text" => {
+                            text_getters = true;
+                            "hl.Bytes".to_owned()
+                        }
+                        Some((Some(n), _)) if n == "Buffer" => {
+                            format!("hl.Abstract<\"{library}_buffer_result\">")
+                        }
+                        Some((_, ty)) => hx_type(ty, Runtime::HashLink)?,
+                    };
+                    native_class.push_str(&format!(
+                        "\n\t{}\n\tpublic static function {getter}():{native_ty};",
+                        native(library, Runtime::HashLink, name, getter),
+                    ));
+                }
+                for helper in reader.helpers {
+                    public.push('\n');
+                    public.push_str(&helper);
+                }
+            }
             let static_ = if instance { "" } else { "static " };
             public.push_str(&format!(
-                "\n\tpublic {static_}inline function {rust_name}({args}):{ret} {{\n{switch}\t}}"
+                "\n\tpublic {static_}inline function {rust_name}({args}):{ret} {{\n\t\treturn read{variants_name}({name}Native.{index}({call_args}));\n\t}}"
             ));
             continue;
         }
@@ -622,16 +629,12 @@ fn hashlink_resource(
     Ok(source(namespace, name, format!("{public}{native_class}")))
 }
 
-/// The declared variants a method returns, and their type's name.
-fn returned_variants<'p>(
-    output: &ReturnType,
-    plugin: &'p super::convert::Plugin,
-) -> Option<(String, &'p super::Variants)> {
+/// The name of the declared variants a method returns, if it returns some.
+fn returned_variants(output: &ReturnType, plugin: &super::convert::Plugin) -> Option<String> {
     let ReturnType::Type(_, ty) = output else {
         return None;
     };
-    let name = simple_name(ty)?;
-    plugin.variants.get(&name).map(|declared| (name, declared))
+    simple_name(ty).filter(|name| plugin.variants.contains_key(name))
 }
 
 /// A Haxe enum of the declared variants, each with its fields.
@@ -655,31 +658,87 @@ fn variants_enum(
     Ok(format!("enum {name} {{\n{}\n}}\n", body.join("\n")))
 }
 
-/// The body that builds a `name` from `index`, the call returning its
-/// variant's index, and `read`, which reads one field through its getter.
-fn variant_switch(
-    name: &str,
-    declared: &super::Variants,
-    method: &syn::Ident,
-    index: &str,
-    read: impl Fn(&str, &Type) -> String,
-) -> String {
-    let mut arms = String::new();
-    for (at, (variant, fields)) in declared.iter().enumerate().skip(1) {
-        let value = if fields.is_empty() {
-            format!("{name}.{variant}")
-        } else {
-            let values = fields
-                .iter()
-                .map(|(field, ty)| read(&super::variant_getter(method, variant, field), ty))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{name}.{variant}({values})")
-        };
-        arms.push_str(&format!("\t\t\tcase {at}: {value};\n"));
+/// How a Haxe surface reads a variants value: from its variant's index,
+/// then each field through a native getter, a nested value through a
+/// helper that reads it the same way.
+struct Reader<'a> {
+    plugin: &'a super::convert::Plugin,
+    /// Each native getter called, and the type of the field it reads, or
+    /// none for a nested value's index.
+    natives: Vec<(String, Option<Type>)>,
+    /// The helpers that build nested values.
+    helpers: Vec<String>,
+    /// A call of a native getter.
+    call: &'a dyn Fn(&str) -> String,
+    /// A field's value from the call reading it.
+    leaf: &'a dyn Fn(String, &Type) -> String,
+}
+
+impl<'a> Reader<'a> {
+    fn new(
+        plugin: &'a super::convert::Plugin,
+        call: &'a dyn Fn(&str) -> String,
+        leaf: &'a dyn Fn(String, &Type) -> String,
+    ) -> Self {
+        Reader {
+            plugin,
+            natives: Vec::new(),
+            helpers: Vec::new(),
+            call,
+            leaf,
+        }
     }
-    let fallback = &declared[0].0;
-    format!("\t\treturn switch ({index}) {{\n{arms}\t\t\tdefault: {name}.{fallback};\n\t\t}}\n")
+
+    /// `read<Name>(index)`, which builds a `name` from its variant's index
+    /// and the getters of what the class kept.
+    fn read(&mut self, name: &str) {
+        let body = self.build(name, &super::variant_prefix(name), "index");
+        self.helpers.push(format!(
+            "\tstatic inline function read{name}(index:Int):{name} {{\n\t\treturn {body};\n\t}}"
+        ));
+    }
+
+    /// The expression building the `name` whose variant `index` gives, its
+    /// fields read by getters beneath `prefix`.
+    fn build(&mut self, name: &str, prefix: &str, index: &str) -> String {
+        let declared = &self.plugin.variants[name];
+        let mut values = Vec::new();
+        for (variant, fields) in declared {
+            let mut args = Vec::new();
+            for (field, ty) in fields {
+                let getter = super::variant_getter(prefix, variant, field);
+                let nested = simple_name(ty).filter(|n| self.plugin.variants.contains_key(n));
+                if let Some(nested) = nested {
+                    let index = format!("{getter}Variant");
+                    self.natives.push((index.clone(), None));
+                    let body = self.build(&nested, &getter, &(self.call)(&index));
+                    self.helpers.push(format!(
+                        "\tstatic inline function {getter}():{nested} {{\n\t\treturn {body};\n\t}}"
+                    ));
+                    args.push(format!("{getter}()"));
+                } else {
+                    self.natives.push((getter.clone(), Some(ty.clone())));
+                    args.push((self.leaf)((self.call)(&getter), ty));
+                }
+            }
+            values.push(if args.is_empty() {
+                format!("{name}.{variant}")
+            } else {
+                format!("{name}.{variant}({})", args.join(", "))
+            });
+        }
+        if values.len() == 1 {
+            return values.remove(0);
+        }
+        let mut arms = String::new();
+        for (at, value) in values.iter().enumerate().skip(1) {
+            arms.push_str(&format!("\t\t\tcase {at}: {value};\n"));
+        }
+        format!(
+            "switch ({index}) {{\n{arms}\t\t\tdefault: {};\n\t\t}}",
+            values[0]
+        )
+    }
 }
 
 /// The names in a Haxe parameter list, `a:Int, b:Float` as `a, b`.

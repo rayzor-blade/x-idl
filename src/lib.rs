@@ -476,15 +476,15 @@ fn dictionary_fields(
 /// Declared variants: each variant's name and its named fields, in order.
 pub(crate) type Variants = Vec<(syn::Ident, Vec<(syn::Ident, Type)>)>;
 
-/// The variants `e` declares. The first has no fields: it is what a failed
-/// call returns. A field is a number, a bool, `Text` or an `Enum`.
-fn declared_variants(e: &syn::ItemEnum) -> Result<Variants, String> {
+/// The variants `e` declares, whose fields are numbers, `bool`, `Text`,
+/// `Buffer`, an `Enum`, or variants named in `kinds`.
+fn declared_variants(e: &syn::ItemEnum, kinds: &HashSet<String>) -> Result<Variants, String> {
     let name = &e.ident;
     if !e.generics.params.is_empty() {
         return Err(format!("variants {name} cannot be generic"));
     }
     let mut out = Vec::new();
-    for (at, v) in e.variants.iter().enumerate() {
+    for v in &e.variants {
         if v.discriminant.is_some() || extension(&v.attrs)? {
             return Err(format!(
                 "{name}::{} takes no value or #[extension]",
@@ -502,21 +502,18 @@ fn declared_variants(e: &syn::ItemEnum) -> Result<Variants, String> {
                 return Err(format!("{name}::{} names its fields", v.ident));
             }
         };
-        if at == 0 && !fields.is_empty() {
-            return Err(format!(
-                "{name}::{} is what a failed call returns, so has no fields",
-                v.ident
-            ));
-        }
         for (field, ty) in &fields {
             let carried = generic(ty, "Enum").is_some()
-                || matches!(
-                    type_name(ty).as_deref(),
-                    Some("i32" | "i64" | "f32" | "f64" | "bool" | "Text")
-                );
+                || type_name(ty).is_some_and(|n| {
+                    kinds.contains(&n)
+                        || matches!(
+                            n.as_str(),
+                            "i32" | "i64" | "f32" | "f64" | "bool" | "Text" | "Buffer"
+                        )
+                });
             if !carried {
                 return Err(format!(
-                    "{name}::{}.{field} is not a number, bool, Text or Enum",
+                    "{name}::{}.{field} is not a number, bool, Text, Buffer, Enum or variants",
                     v.ident
                 ));
             }
@@ -529,30 +526,163 @@ fn declared_variants(e: &syn::ItemEnum) -> Result<Variants, String> {
     Ok(out)
 }
 
-/// A variant field as its enum holds it: text as a `String`, an enum as
-/// its value.
+/// An error if variants hold themselves, directly or through others: a
+/// value of them could never end.
+fn acyclic(variants: &HashMap<String, Variants>) -> Result<(), String> {
+    fn visit(
+        name: &str,
+        variants: &HashMap<String, Variants>,
+        open: &mut Vec<String>,
+        done: &mut HashSet<String>,
+    ) -> Result<(), String> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if open.iter().any(|n| n == name) {
+            return Err(format!("variants {name} hold themselves"));
+        }
+        open.push(name.to_owned());
+        for (_, fields) in &variants[name] {
+            for (_, ty) in fields {
+                if let Some(nested) = type_name(ty).filter(|n| variants.contains_key(n)) {
+                    visit(&nested, variants, open, done)?;
+                }
+            }
+        }
+        open.pop();
+        done.insert(name.to_owned());
+        Ok(())
+    }
+    let mut done = HashSet::new();
+    for name in variants.keys() {
+        visit(name, variants, &mut Vec::new(), &mut done)?;
+    }
+    Ok(())
+}
+
+/// A variant field as its enum holds it: text as a `String`, bytes as
+/// `VariantBytes`, an enum as its value.
 fn variant_storage(ty: &Type) -> TokenStream {
     if let Some(enumeration) = generic(ty, "Enum") {
-        quote!(#enumeration)
-    } else if type_name(ty).as_deref() == Some("Text") {
-        quote!(String)
-    } else {
-        quote!(#ty)
+        return quote!(#enumeration);
+    }
+    match type_name(ty).as_deref() {
+        Some("Text") => quote!(String),
+        Some("Buffer") => quote!(VariantBytes),
+        _ => quote!(#ty),
     }
 }
 
-/// The getter that reads `field` of `variant` from what `method` last
-/// returned, on runtimes that build the value in the language.
-pub(crate) fn variant_getter(
-    method: &syn::Ident,
-    variant: &syn::Ident,
-    field: &syn::Ident,
-) -> String {
-    format!(
-        "{}{variant}{}",
-        method.unraw(),
-        pascal(&field.unraw().to_string())
-    )
+/// The getter that reads `field` of `variant` beneath `prefix`: the
+/// variants type's prefix, then each variant and field on the way down.
+pub(crate) fn variant_getter(prefix: &str, variant: &syn::Ident, field: &syn::Ident) -> String {
+    let field: String = field
+        .unraw()
+        .to_string()
+        .split('_')
+        .map(pascal)
+        .collect();
+    format!("{prefix}{variant}{field}")
+}
+
+/// What the getters of a variants type's fields begin with: its name, in
+/// lower camel case.
+pub(crate) fn variant_prefix(kind: &str) -> String {
+    let mut chars = kind.chars();
+    chars
+        .next()
+        .map(|c| c.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// One step down into a variants value: its type, the variant, the field.
+type Step = (syn::Ident, syn::Ident, syn::Ident);
+
+/// `read` of `found`, the value at the end of `path` in what `slot` holds,
+/// or `miss` where that value has another shape.
+fn reach(slot: &syn::Ident, path: &[Step], read: TokenStream, miss: &TokenStream) -> TokenStream {
+    let mut body = read;
+    for (owner, variant, field) in path.iter().rev() {
+        body = quote! {
+            match found {
+                #owner::#variant { #field: found, .. } => #body,
+                _ => #miss,
+            }
+        };
+    }
+    quote! {
+        #slot.with(|slot| {
+            let held = slot.borrow();
+            let found = &*held;
+            #body
+        })
+    }
+}
+
+/// The getters for every field of the variants `name` at `path` in what a
+/// call kept in `slot`: an index for each nested value, which has getters
+/// of its own, and one getter for each other field.
+#[allow(clippy::too_many_arguments)]
+fn variant_getters(
+    class: &syn::Ident,
+    slot: &syn::Ident,
+    prefix: &str,
+    name: &str,
+    path: &[Step],
+    variants: &HashMap<String, Variants>,
+    names: &mut HashSet<String>,
+    methods: &mut TokenStream,
+) -> Result<(), String> {
+    let owner = ident(name)?;
+    for (variant, fields) in &variants[name] {
+        for (field, ty) in fields {
+            let getter = variant_getter(prefix, variant, field);
+            let mut step = path.to_vec();
+            step.push((owner.clone(), variant.clone(), field.clone()));
+            if let Some(nested) = type_name(ty).filter(|n| variants.contains_key(n)) {
+                let index = ident(&format!("{getter}Variant"))?;
+                if !names.insert(index.to_string()) {
+                    return Err(format!("generated method {class}.{index} is duplicated"));
+                }
+                let read = reach(slot, &step, quote!(found.variant()), &quote!(0));
+                methods.extend(quote! {
+                    #[allow(unreachable_patterns)]
+                    pub extern "C" fn #index() -> i32 { #read }
+                });
+                variant_getters(
+                    class, slot, &getter, &nested, &step, variants, names, methods,
+                )?;
+                continue;
+            }
+            let getter = ident(&getter)?;
+            if !names.insert(getter.to_string()) {
+                return Err(format!("generated method {class}.{getter} is duplicated"));
+            }
+            let (ret, read, miss) = if let Some(e) = generic(ty, "Enum") {
+                (
+                    quote!(Enum<#e>),
+                    quote!((*found).into()),
+                    quote!(#e::default().into()),
+                )
+            } else {
+                match type_name(ty).as_deref() {
+                    Some("Text") => (quote!(Text), quote!(Text::new(found)), quote!(Text::NULL)),
+                    Some("Buffer") => (
+                        quote!(Buffer),
+                        quote!(Buffer::new(&found.0)),
+                        quote!(Buffer::NULL),
+                    ),
+                    _ => (quote!(#ty), quote!(*found), quote!(Default::default())),
+                }
+            };
+            let body = reach(slot, &step, read, &miss);
+            methods.extend(quote! {
+                #[allow(unreachable_patterns)]
+                pub extern "C" fn #getter() -> #ret { #body }
+            });
+        }
+    }
+    Ok(())
 }
 
 /// An integer literal discriminant, possibly negative.
@@ -1400,16 +1530,27 @@ fn generate_parts(
     // one of several shapes, which a resource method returns.
     let mut variants: HashMap<String, Variants> = HashMap::new();
     if let Ok(file) = &file {
+        let kinds: HashSet<String> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(e)
+                    if e.variants
+                        .iter()
+                        .any(|v| matches!(v.fields, syn::Fields::Named(_))) =>
+                {
+                    Some(e.ident.to_string())
+                }
+                _ => None,
+            })
+            .collect();
         for item in &file.items {
             let Item::Enum(e) = item else { continue };
-            if e.variants
-                .iter()
-                .any(|v| matches!(v.fields, syn::Fields::Named(_)))
-            {
-                variants.insert(e.ident.to_string(), declared_variants(e)?);
-                continue;
+            if kinds.contains(&e.ident.to_string()) {
+                variants.insert(e.ident.to_string(), declared_variants(e, &kinds)?);
             }
         }
+        acyclic(&variants)?;
         for item in &file.items {
             let Item::Enum(e) = item else { continue };
             if variants.contains_key(&e.ident.to_string())
@@ -1523,13 +1664,8 @@ fn generate_parts(
                     for (at, (variant, fields)) in declared.iter().enumerate() {
                         let at =
                             proc_macro2::Literal::i32_unsuffixed(i32::try_from(at).map_err(error)?);
-                        let default = if shapes.is_empty() {
-                            quote!(#[default])
-                        } else {
-                            quote!()
-                        };
                         if fields.is_empty() {
-                            shapes.push(quote!(#default #variant));
+                            shapes.push(quote!(#variant));
                             indices.push(quote!(Self::#variant => #at));
                             continue;
                         }
@@ -1548,15 +1684,27 @@ fn generate_parts(
                     }
                     let derive = if target == RustTarget::Caribou {
                         quote! {
-                            #[derive(Debug, Clone, PartialEq, Default, caribou_abi::PluginEnum)]
+                            #[derive(Debug, Clone, PartialEq, caribou_abi::PluginEnum)]
                             #[caribou(name = #schema)]
                         }
                     } else {
-                        quote!(#[derive(Debug, Clone, PartialEq, Default)])
+                        quote!(#[derive(Debug, Clone, PartialEq)])
+                    };
+                    // The first variant, its fields at their defaults: what a
+                    // failed call returns.
+                    let (first, fields) = &declared[0];
+                    let default = if fields.is_empty() {
+                        quote!(Self::#first)
+                    } else {
+                        let fields = fields.iter().map(|(field, _)| field);
+                        quote!(Self::#first { #(#fields: Default::default()),* })
                     };
                     output.extend(quote! {
                         #derive
                         pub enum #name { #(#shapes),* }
+                        impl Default for #name {
+                            fn default() -> Self { #default }
+                        }
                         impl #name {
                             /// The variant's position in the declaration.
                             #[allow(dead_code)]
@@ -2085,6 +2233,8 @@ fn generate_parts(
                     let mut methods = TokenStream::new();
                     let mut signatures = TokenStream::new();
                     let mut statics = TokenStream::new();
+                    // The variants types whose last value this class keeps.
+                    let mut kept = HashSet::new();
                     let mut names = HashSet::new();
                     for method in &t.items {
                         let TraitItem::Fn(f) = method else {
@@ -2194,7 +2344,7 @@ fn generate_parts(
                             #raise_call;
                         };
                         if let ReturnType::Type(_, ty) = &f.sig.output
-                            && let Some(declared) = type_name(ty).and_then(|n| variants.get(&n))
+                            && type_name(ty).is_some_and(|n| variants.contains_key(&n))
                         {
                             if !backend_fns.iter().any(|b| b.name == native) {
                                 backend_fns.push(BackendFn {
@@ -2222,21 +2372,17 @@ fn generate_parts(
                             }
                             // A runtime that cannot take the value whole takes
                             // its variant's index, then each field it holds
-                            // through a getter that reads what this call kept.
-                            let slot = quote::format_ident!("__XIDL_{}_{}", class, name.unraw());
+                            // through a getter that reads what the call kept.
+                            // A class keeps one value of each variants type it
+                            // returns, which every method returning it shares.
+                            let kind = type_name(ty).expect("named variants");
+                            let slot = quote::format_ident!("__XIDL_{}_{}", class, kind);
                             let index = ident(&format!("{}Variant", name.unraw()))?;
                             if !names.insert(index.to_string()) {
                                 return Err(format!(
                                     "generated method {class}.{index} is duplicated"
                                 ));
                             }
-                            statics.extend(quote! {
-                                thread_local! {
-                                    #[allow(non_upper_case_globals)]
-                                    static #slot: std::cell::RefCell<#ty> =
-                                        std::cell::RefCell::new(<#ty>::default());
-                                }
-                            });
                             methods.extend(quote! {
                                 pub extern "C" fn #index(#(#params),*) -> i32 {
                                     let value: #ty = #value;
@@ -2245,40 +2391,24 @@ fn generate_parts(
                                     index
                                 }
                             });
-                            for (variant, fields) in declared {
-                                for (field, field_ty) in fields {
-                                    let getter = ident(&variant_getter(name, variant, field))?;
-                                    if !names.insert(getter.to_string()) {
-                                        return Err(format!(
-                                            "generated method {class}.{getter} is duplicated"
-                                        ));
+                            if kept.insert(kind.clone()) {
+                                statics.extend(quote! {
+                                    thread_local! {
+                                        #[allow(non_upper_case_globals)]
+                                        static #slot: std::cell::RefCell<#ty> =
+                                            std::cell::RefCell::new(<#ty>::default());
                                     }
-                                    let (ret, read, miss) = if let Some(e) =
-                                        generic(field_ty, "Enum")
-                                    {
-                                        (
-                                            quote!(Enum<#e>),
-                                            quote!((*found).into()),
-                                            quote!(#e::default().into()),
-                                        )
-                                    } else if type_name(field_ty).as_deref() == Some("Text") {
-                                        (quote!(Text), quote!(Text::new(found)), quote!(Text::NULL))
-                                    } else {
-                                        (
-                                            quote!(#field_ty),
-                                            quote!(*found),
-                                            quote!(Default::default()),
-                                        )
-                                    };
-                                    methods.extend(quote! {
-                                        pub extern "C" fn #getter() -> #ret {
-                                            #slot.with(|slot| match &*slot.borrow() {
-                                                #ty::#variant { #field: found, .. } => #read,
-                                                _ => #miss,
-                                            })
-                                        }
-                                    });
-                                }
+                                });
+                                variant_getters(
+                                    class,
+                                    &slot,
+                                    &variant_prefix(&kind),
+                                    &kind,
+                                    &[],
+                                    &variants,
+                                    &mut names,
+                                    &mut methods,
+                                )?;
                             }
                             continue;
                         }
@@ -2407,6 +2537,32 @@ fn generate_parts(
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+    let carries_bytes = variants.values().flatten().any(|(_, fields)| {
+        fields
+            .iter()
+            .any(|(_, ty)| type_name(ty).as_deref() == Some("Buffer"))
+    });
+    if carries_bytes {
+        output.extend(quote! {
+            /// Bytes a variant holds, Rust's until the value reaches the
+            /// language.
+            #[derive(Debug, Clone, PartialEq, Default)]
+            pub struct VariantBytes(pub Vec<u8>);
+        });
+        if target == RustTarget::Caribou {
+            output.extend(quote! {
+                impl caribou_abi::EnumField for VariantBytes {
+                    const TAG: caribou_abi::TypeTag = caribou_abi::TypeTag::BUFFER;
+                    fn into_value(self) -> caribou_abi::Value {
+                        caribou_abi::Buffer::new(&self.0).value()
+                    }
+                    fn from_value(value: caribou_abi::Value) -> Self {
+                        Self(caribou_abi::Buffer::of(value).map(|b| b.to_vec()).unwrap_or_default())
+                    }
+                }
+            });
         }
     }
     let plugin = convert::Plugin {
@@ -2937,19 +3093,19 @@ mod test {
     fn rayzor_and_hashlink_read_variants_field_by_field() {
         let rayzor = generate_rayzor("window", make_declaration(VARIANTS_API), "").unwrap();
         syn::parse_file(&rayzor).unwrap();
-        assert!(rayzor.contains("static __XIDL_Window_poll"));
+        assert!(rayzor.contains("static __XIDL_Window_Event"));
         assert!(rayzor.contains("fn pollVariant (this : & Window) -> i32"));
-        assert!(rayzor.contains("fn pollResizedWidth () -> i32"));
-        assert!(rayzor.contains("fn pollPressedText () -> Text"));
-        assert!(rayzor.contains("fn pollPressedButton () -> Enum < Button >"));
-        assert!(rayzor.contains("export_name = \"xidl_window_poll_pressed_text\""));
+        assert!(rayzor.contains("fn eventResizedWidth () -> i32"));
+        assert!(rayzor.contains("fn eventPressedText () -> Text"));
+        assert!(rayzor.contains("fn eventPressedButton () -> Enum < Button >"));
+        assert!(rayzor.contains("export_name = \"xidl_window_event_pressed_text\""));
         assert!(!rayzor.contains("PluginEnum"));
 
         let hashlink = generate_hashlink("window", make_declaration(VARIANTS_API), "").unwrap();
         syn::parse_file(&hashlink).unwrap();
         assert!(hashlink.contains("hlp_window_poll_variant"));
         assert!(hashlink.contains("\"Pi_i\""));
-        assert!(hashlink.contains("hlp_window_poll_pressed_at"));
+        assert!(hashlink.contains("hlp_window_event_pressed_at"));
         assert!(hashlink.contains("\"P_d\""));
 
         for runtime in [crate::haxe::Runtime::Rayzor, crate::haxe::Runtime::HashLink] {
@@ -2978,18 +3134,95 @@ mod test {
     }
 
     #[test]
-    fn variants_are_results_with_a_bare_first_variant() {
+    fn variants_are_results_of_what_every_runtime_carries() {
         for api in [
-            "enum E { A { x: i32 } } trait R { #[native(f)] fn f(this: &R) -> E; }",
             "enum E { A, B { x: Vec<i32> } }",
             "enum E { A, B { x: i32 } } trait R { #[native(f)] fn f(this: &R, e: E); }",
             "enum E { A, B { x: i32 } } struct S { e: E }",
             "enum E { A, B { x: Enum<Missing> } }",
+            "enum E { A, B { x: Missing } }",
+            "enum A { X { b: B } } enum B { Y { a: A } }",
         ] {
             assert!(
                 generate("w", make_declaration(api), "").is_err(),
                 "accepted {api}"
             );
+        }
+    }
+
+    const NESTED_API: &str = r#"
+        enum Code { Unknown, KeyA }
+        enum Text2 { None, Some { text: Text } }
+        enum Physical { Code { code: Enum<Code> }, Native { scancode: i64 } }
+        enum KeyEvent { Input { physical: Physical, text: Text2, repeat: bool } }
+        enum Path { Utf8 { path: Text }, Bytes { bytes: Buffer } }
+        enum Event {
+            None,
+            Key { device: i32, event: KeyEvent },
+            Dropped { path: Path },
+        }
+        trait Window {
+            #[native(window_poll)] fn poll(this: &Window) -> Event;
+        }
+    "#;
+
+    #[test]
+    fn variants_nest_and_carry_bytes() {
+        let caribou = generate("window", make_declaration(NESTED_API), "").unwrap();
+        syn::parse_file(&caribou).unwrap();
+        assert!(caribou.contains("Key { device : i32 , event : KeyEvent }"));
+        assert!(caribou.contains("Bytes { bytes : VariantBytes }"));
+        assert!(caribou.contains("impl caribou_abi :: EnumField for VariantBytes"));
+        assert!(caribou.contains("enum KeyEvent ;"));
+        // A first variant with fields defaults them.
+        assert!(caribou.contains(
+            "Self :: Input { physical : Default :: default () , text : Default :: default () , repeat : Default :: default () }"
+        ));
+
+        let rayzor = generate_rayzor("window", make_declaration(NESTED_API), "").unwrap();
+        syn::parse_file(&rayzor).unwrap();
+        assert!(!rayzor.contains("EnumField"));
+        for getter in [
+            "fn pollVariant (this : & Window) -> i32",
+            "fn eventKeyEventVariant () -> i32",
+            "fn eventKeyEventInputPhysicalVariant () -> i32",
+            "fn eventKeyEventInputPhysicalCodeCode () -> Enum < Code >",
+            "fn eventKeyEventInputPhysicalNativeScancode () -> i64",
+            "fn eventKeyEventInputTextSomeText () -> Text",
+            "fn eventDroppedPathBytesBytes () -> Buffer",
+        ] {
+            assert!(rayzor.contains(getter), "{getter}");
+        }
+        assert!(rayzor.contains("Buffer :: new (& found . 0)"));
+
+        for runtime in [crate::haxe::Runtime::Rayzor, crate::haxe::Runtime::HashLink] {
+            let files =
+                crate::haxe::generate("window", make_declaration(NESTED_API), "", runtime).unwrap();
+            let file = |name: &str| {
+                files
+                    .iter()
+                    .find(|f| f.path == format!("window/{name}.hx"))
+                    .unwrap()
+                    .source
+                    .clone()
+            };
+            assert!(
+                file("KeyEvent").contains("Input(physical:Physical, text:Text2, repeat:Bool);")
+            );
+            assert!(file("Path").contains("Bytes(bytes:haxe.io.Bytes);"));
+            let window = file("Window");
+            assert!(
+                window.contains("static inline function readEvent(index:Int):Event {"),
+                "{window}"
+            );
+            assert!(
+                window.contains("static inline function eventKeyEvent():KeyEvent {"),
+                "{window}"
+            );
+            assert!(
+                window.contains("static inline function eventKeyEventInputPhysical():Physical {")
+            );
+            assert!(window.contains("case 1: Event.Key("), "{window}");
         }
     }
 
