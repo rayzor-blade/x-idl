@@ -55,6 +55,7 @@ fn extension(attrs: &[syn::Attribute]) -> Result<bool, String> {
 /// identifier, which `plugin!` exports without the `r#`.
 fn ident(name: &str) -> Result<syn::Ident, String> {
     syn::parse_str(name).or_else(|e| {
+        println!("Failed to parse identifier '{}': {}", name, e); // Debugging line
         let raw = !matches!(name, "self" | "Self" | "super" | "crate" | "_")
             && syn::parse_str::<syn::Ident>(&format!("r#{name}")).is_ok();
         if raw {
@@ -1196,7 +1197,6 @@ fn generate_parts(
     };
 
     let file = syn::parse_file(&desc_content);
-   
     let idl = tokens(webidl)?;
     let aliases = typedefs(&idl);
 
@@ -2207,7 +2207,40 @@ fn web_backend_for(
 mod test {
     use std::{env::temp_dir, path::PathBuf};
 
-    use crate::{enum_values, generate, pascal, tokens};
+    use crate::{enum_values, generate, generate_rayzor, pascal, tokens, web_backend};
+
+
+    #[test]
+    fn rayzor_model_uses_adapter_carriers_and_exports_native_symbols() {
+        let api = r#"
+            enum Mode { Fast, Slow }
+            struct Options { label: Option<Text>, mode: Enum<Mode> }
+            trait Device {
+                #[native(device_open)] fn open(options: &Options) -> Box<Device>;
+                #[native(device_name)] fn name(this: &Device) -> Text;
+            }
+        "#;
+        let api_path = temp_dir().join("rayzor_api.rs");
+
+        std::fs::write(&api_path, api).unwrap();
+
+        let generated = generate_rayzor("gpu", Some(api_path), "").unwrap();
+
+        assert!(!generated.contains("caribou_abi"));
+        assert!(!generated.contains("plugin !"));
+        assert!(generated.contains("Rooted < Text >"));
+        assert!(generated.contains("impl NativeEnum for Mode"));
+        assert!(generated.contains("export_name = \"xidl_options_new\""));
+        assert!(generated.contains("export_name = \"xidl_device_open\""));
+        assert!(generated.contains("host :: raise (ErrorKind :: Runtime"));
+        assert!(generated.contains("pub static XIDL_METHODS"));
+        assert!(generated.contains("\"gpu::Device\""));
+        assert!(generated.contains("__xidl_device_open as * const u8"));
+        assert!(generated.contains("fn __xidl_options_new (a0 : i64)"));
+        assert!(generated.contains("transmute :: < i64 , Enum < Mode > >"));
+        assert!(generated.contains("param_types : [3u8 , 0u8"));
+    }
+
 
     #[test]
     fn webidl_comments_and_spacing_do_not_change_enum_values() {
@@ -2247,7 +2280,6 @@ mod test {
             idl,
         )
         .unwrap();
-        println!("generated code:\n{generated}");
         assert!(generated.contains("MaxTextureDimension1D"));
         assert!(generated.contains("MaxBufferSize"));
     }
@@ -2548,6 +2580,64 @@ mod test {
                 generate("gpu", make_declaration(api), idl).is_err(),
                 "accepted {api}"
             );
+        }
+    }
+
+     #[test]
+    fn a_web_backend_converts_records_to_the_wires_dictionaries() {
+        let idl = r#"
+          enum GPUFilterMode { "nearest", "linear" };
+          enum GPUAutoLayoutMode { "auto" };
+          interface GPUBuffer {};
+          interface GPUSampler {};
+          interface GPUPipelineLayout {};
+          interface GPUDevice {
+            undefined make(GPUThing descriptor);
+            undefined lay(GPULaid descriptor);
+          };
+          typedef (GPUSampler or GPUBuffer or GPUBinding) GPUResource;
+          dictionary GPUBinding { required GPUBuffer buffer; GPUSize64 size; };
+          typedef [EnforceRange] unsigned long long GPUSize64;
+          dictionary GPUThing {
+            USVString label = "";
+            required GPUSize64 size;
+            GPUFilterMode filter = "nearest";
+            sequence<GPUResource> resources = [];
+          };
+          dictionary GPULaid { required (GPUPipelineLayout or GPUAutoLayoutMode) layout; };
+        "#;
+        let declaration = r#"
+          #[idl("GPUFilterMode")] enum Filter { #[extension] Cubic }
+          #[idl("GPUBuffer")] trait Buffer {}
+          #[idl("GPUSampler")] trait Sampler {}
+          #[idl("GPUPipelineLayout")] trait Layout {}
+          #[idl("GPUDevice")] trait Device {}
+          #[idl("GPUBinding")] struct Binding {}
+          #[idl("GPUResource")]
+          enum Resource { Sampler(Sampler), Buffer(Buffer), Binding(Binding) }
+          #[idl("GPUThing")] struct Thing { #[extension] native: Option<i32> }
+          #[idl("GPULaid")] struct Laid { layout: Option<Layout> }
+        "#;
+        let declaration_path = temp_dir().join("gpu.api.rs");
+        std::fs::write(&declaration_path, declaration)
+            .map_err(|e| format!("failed to write gpu.api.rs: {e}"))
+            .unwrap();
+        let web = "pub fn laid_layout() {}";
+        let generated = web_backend("gpu", Some(declaration_path), idl, web).unwrap();
+        syn::parse_file(&generated).unwrap();
+        let flat = generated.replace(' ', "");
+        for expected in [
+            "implcrate::Thing{",
+            "fnwire(&self)->Result<crate::wire::GPUThing,String>",
+            "ifself.native.is_some(){returnErr(\"`Thing.native`isnotavailableontheweb\".to_owned());}",
+            "label:match&self.label{Some(x)=>Some(x.get().as_str().to_owned()),None=>None}",
+            "size:*(&self.size)asu64",
+            "filter:match&self.filter{Some(x)=>Some(crate::wire::GPUFilterMode::from_index(*xasu32)",
+            "crate::Resource::Buffer(x)=>crate::wire::GPUResource::GPUBuffer(crate::wire::Handle(*xasu32))",
+            "crate::Resource::Binding(x)=>crate::wire::GPUResource::GPUBinding(x.wire()?)",
+            "layout:crate::web::laid_layout(&self.layout)?",
+        ] {
+            assert!(flat.contains(expected), "{expected} in {generated}");
         }
     }
 }
