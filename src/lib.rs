@@ -1328,11 +1328,11 @@ fn hashlink_argument(
             quote!(unsafe { Text::from_hl(#name) }),
         )),
         Some("Buffer") => Ok((
-            quote!(#name: *mut HlBytes),
+            quote!(#name: *mut runtime::HlBytes),
             quote!(unsafe { Buffer::from_hl(#name) }),
         )),
         Some("BufferMut") => Ok((
-            quote!(#name: *mut HlBytes),
+            quote!(#name: *mut runtime::HlBytes),
             quote!(unsafe { BufferMut::from_hl(#name) }),
         )),
         Some("i32" | "u32" | "i64" | "u64" | "f32" | "f64" | "bool") => {
@@ -1467,16 +1467,6 @@ fn hashlink_registration(
     if count == 0 {
         return Err("HashLink generation produced no primitives".into());
     }
-    wrappers.extend(quote! {
-        /// A `haxe.io.Bytes` as HashLink lays it out, which a `Buffer`
-        /// argument arrives as.
-        #[repr(C)]
-        pub struct HlBytes {
-            pub t: *mut hl_abi::hl_type,
-            pub length: i32,
-            pub b: *mut u8,
-        }
-    });
     if returns_bytes {
         // What the Haxe surface's XidlBytes copies a Buffer result out with.
         let len = format!("PX{library}_buffer_result__i");
@@ -1494,7 +1484,7 @@ fn hashlink_registration(
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn __hl_buffer_result_copy(
                 value: *mut runtime::Managed<Buffer>,
-                out: *mut HlBytes,
+                out: *mut runtime::HlBytes,
             ) {
                 if value.is_null() || out.is_null() {
                     return;
@@ -3291,7 +3281,7 @@ mod test {
         assert!(hashlink.contains("\"Pi_Xxwindow_buffer_result_\""));
         // A Buffer argument is a haxe.io.Bytes: its length, then its bytes.
         assert!(hashlink.contains("\"PiOiB__v\""));
-        assert!(hashlink.contains("a1 : * mut HlBytes"));
+        assert!(hashlink.contains("a1 : * mut runtime :: HlBytes"));
         assert!(hashlink.contains("\"PXxwindow_buffer_result_OiB__v\""));
         let rayzor = library
             .generate_rayzor("window", make_declaration(api), "", &[])
