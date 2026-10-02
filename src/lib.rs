@@ -1030,6 +1030,20 @@ impl<'a> Library<'a> {
         webidl: &str,
         adapter_resources: &[&str],
     ) -> Result<String, String> {
+        self.generate_rayzor_in(namespace, namespace, declaration, webidl, adapter_resources)
+    }
+
+    /// As `generate_rayzor`, naming each class in the method table by the
+    /// Haxe package its externs are in (`rayzor.gpu`), as `haxe` is given
+    /// it. Rayzor matches a method to its extern by that name.
+    pub fn generate_rayzor_in(
+        self,
+        namespace: &str,
+        package: &str,
+        declaration: Option<PathBuf>,
+        webidl: &str,
+        adapter_resources: &[&str],
+    ) -> Result<String, String> {
         let library = self.name()?;
         let adapter_resources = adapter_resources
             .iter()
@@ -1042,7 +1056,7 @@ impl<'a> Library<'a> {
             RustTarget::Rayzor,
             &adapter_resources,
         )?;
-        let registration = rayzor_registration(namespace, &model, library)?;
+        let registration = rayzor_registration(package, &model, library)?;
         Ok(format!("{model} {registration}"))
     }
 
@@ -1077,6 +1091,17 @@ pub fn generate_hashlink(
     webidl: &str,
 ) -> Result<String, String> {
     Library::XIDL.generate_hashlink(namespace, declaration, webidl)
+}
+
+/// `Library::generate_rayzor_in` in the `xidl` library.
+pub fn generate_rayzor_in(
+    namespace: &str,
+    package: &str,
+    declaration: Option<PathBuf>,
+    webidl: &str,
+    adapter_resources: &[&str],
+) -> Result<String, String> {
+    Library::XIDL.generate_rayzor_in(namespace, package, declaration, webidl, adapter_resources)
 }
 
 /// `Library::generate_rayzor` in the `xidl` library.
@@ -1224,7 +1249,7 @@ fn rayzor_return(
 /// Describe every generated C export to Rayzor's compiler and return the same
 /// function pointers to its runtime linker. This is derived from the emitted
 /// model so the externs, method table and actual symbols cannot drift apart.
-fn rayzor_registration(namespace: &str, model: &str, library: &str) -> Result<String, String> {
+fn rayzor_registration(package: &str, model: &str, library: &str) -> Result<String, String> {
     let file = syn::parse_file(model).map_err(error)?;
     let mut descriptors = TokenStream::new();
     let mut symbols = TokenStream::new();
@@ -1257,7 +1282,7 @@ fn rayzor_registration(namespace: &str, model: &str, library: &str) -> Result<St
                 haxe::snake(&method.sig.ident.unraw().to_string())
             );
             let method_name = method.sig.ident.unraw().to_string();
-            let class_name = format!("{namespace}::{class}");
+            let class_name = format!("{}::{class}", package.replace('.', "::"));
             let mut params = Vec::new();
             let mut wrapper_params = Vec::new();
             let mut wrapper_args = Vec::new();
@@ -2854,6 +2879,37 @@ mod test {
     use crate::{
         enum_values, generate, generate_hashlink, generate_rayzor, pascal, tokens, web_backend,
     };
+
+    #[test]
+    fn rayzor_methods_name_classes_as_the_externs_do() {
+        let api = r#"
+            trait Device {
+                #[native(device_name)] fn name(this: &Device) -> Text;
+            }
+        "#;
+        let api_path = temp_dir().join(format!("rayzor-package-{}.rs", std::process::id()));
+        std::fs::write(&api_path, api).unwrap();
+        let generated =
+            crate::generate_rayzor_in("gpu", "rayzor.gpu", Some(api_path.clone()), "", &[]).unwrap();
+        let externs = crate::haxe::generate(
+            "rayzor.gpu",
+            Some(api_path.clone()),
+            "",
+            crate::haxe::Runtime::Rayzor,
+        )
+        .unwrap();
+        std::fs::remove_file(api_path).ok();
+        assert!(generated.contains("\"rayzor::gpu::Device\""), "{generated}");
+        let device = externs
+            .iter()
+            .find(|f| f.path.ends_with("Device.hx"))
+            .expect("a Device extern");
+        assert!(
+            device.source.contains("@:native(\"rayzor::gpu::Device\")"),
+            "{}",
+            device.source
+        );
+    }
 
     #[test]
     fn rayzor_model_uses_adapter_carriers_and_exports_native_symbols() {
