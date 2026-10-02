@@ -1,1 +1,1 @@
-{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":3,"timestamp":1790978822,"nonce":"fNDwbmwG5q1a0WP4expwxkawTzo=","message":"Fixed in 143b7c82ed89c70bff7bc2eff3b68a4233580d31. The contract is in src/forward.rs's module doc; xgpu's api/gpu.api.rs tags 28 methods.","files":null}]}
+{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":4,"timestamp":1790978822,"nonce":"XSno6jGs9mUxWRNiC5MI8PJbfnU=","status":2}]}
