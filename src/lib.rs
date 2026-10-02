@@ -1,4 +1,5 @@
 mod convert;
+mod forward;
 pub mod haxe;
 pub mod haxe_js;
 pub mod idl;
@@ -399,31 +400,118 @@ fn idl_type(
     Err(format!("unsupported WebIDL type {spelling}"))
 }
 
-fn operation_return(
+/// Every body of `kind name`, its partial definitions included. A mixin's
+/// is found as `mixin name`.
+fn bodies<'a>(tokens: &'a [String], kind: &str, name: &str) -> Vec<&'a [String]> {
+    let mut found = Vec::new();
+    for (at, pair) in tokens.windows(2).enumerate() {
+        if pair[0] != kind || pair[1] != name {
+            continue;
+        }
+        let Some(open) = tokens[at + 2..].iter().position(|s| s == "{") else {
+            continue;
+        };
+        let open = at + 2 + open;
+        let mut depth = 0usize;
+        for (offset, token) in tokens[open..].iter().enumerate() {
+            match token.as_str() {
+                "{" => depth += 1,
+                "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        found.push(&tokens[open + 1..open + offset]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// The type a WebIDL member gives: an operation's return or an
+/// attribute's type. `source` is `Interface.member`, and an interface's
+/// members include its partial definitions' and its mixins'.
+fn member_return(
     tokens: &[String],
     source: &str,
     aliases: &HashMap<String, Vec<String>>,
     named: &HashMap<String, Type>,
 ) -> Result<Type, String> {
-    let (interface, operation) = source
+    let (interface, member) = source
         .split_once('.')
-        .ok_or_else(|| format!("WebIDL operation {source} must be Interface.method"))?;
-    let matches: Vec<_> = statements(body(tokens, "interface", interface)?)
-        .into_iter()
-        .filter_map(|statement| {
-            statement
+        .ok_or_else(|| format!("WebIDL member {source} must be Interface.member"))?;
+    let mut scopes = bodies(tokens, "interface", interface);
+    if scopes.is_empty() {
+        return Err(format!("no WebIDL interface {interface}"));
+    }
+    for window in tokens.windows(3) {
+        if window[0] == interface && window[1] == "includes" {
+            scopes.extend(bodies(tokens, "mixin", &window[2]));
+        }
+    }
+    let mut matches: Vec<&[String]> = Vec::new();
+    for scope in scopes {
+        for statement in statements(scope) {
+            if let Some(at) = statement
                 .windows(2)
-                .position(|part| part[0] == operation && part[1] == "(")
-                .map(|at| &statement[..at])
-        })
-        .collect();
+                .position(|part| part[0] == member && part[1] == "(")
+            {
+                matches.push(&statement[..at]);
+            } else if let Some(attribute) = statement.iter().position(|t| t == "attribute")
+                && statement.len() > attribute + 2
+                && statement.last().is_some_and(|t| t == member)
+            {
+                matches.push(&statement[attribute + 1..statement.len() - 1]);
+            }
+        }
+    }
+    // Overloads may share a return type.
+    matches.dedup_by(|a, b| a == b);
     if matches.len() != 1 {
         return Err(format!(
-            "expected one WebIDL operation {source}, found {}",
+            "expected one WebIDL member {source}, found {}",
             matches.len()
         ));
     }
-    idl_type(matches[0], aliases, named, &mut HashSet::new())
+    let tokens: Vec<String> = matches[0]
+        .iter()
+        .filter(|t| !matches!(t.as_str(), "static" | "readonly" | "inherit"))
+        .cloned()
+        .collect();
+    idl_type(&tokens, aliases, named, &mut HashSet::new())
+}
+
+/// Whether a method tagged with WebIDL member `source` returns what that
+/// member gives. A resource is returned boxed, and a resource that imports
+/// no WebIDL interface stands for whichever the member names.
+fn check_member(
+    tokens: &[String],
+    source: &str,
+    aliases: &HashMap<String, Vec<String>>,
+    named: &HashMap<String, Type>,
+    declared: &Type,
+    untagged: &HashSet<String>,
+) -> Result<(), String> {
+    let declared = generic(declared, "Box").unwrap_or_else(|| declared.clone());
+    match member_return(tokens, source, aliases, named) {
+        Ok(imported) if quote!(#imported).to_string() == quote!(#declared).to_string() => Ok(()),
+        Ok(imported) => Err(format!(
+            "returns {}, but {source} maps to {}",
+            quote!(#declared),
+            quote!(#imported)
+        )),
+        Err(e) if e.starts_with("unsupported WebIDL type") => {
+            let resource = generic(&declared, "Future").unwrap_or(declared);
+            if type_name(&resource).is_some_and(|n| untagged.contains(&n)) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn dictionary_fields(
@@ -1018,6 +1106,19 @@ struct BackendFn {
     params: Vec<TokenStream>,
     ret: TokenStream,
     fallback: TokenStream,
+    /// The WebIDL member a method is tagged with, from which a web backend
+    /// generates the function when its adapter does not write it.
+    member: Option<Member>,
+}
+
+/// A method tagged `#[idl("Interface.member")]`, as its declaration has it.
+struct Member {
+    /// `GPUTexture.width`.
+    source: String,
+    class: syn::Ident,
+    /// Each argument's declared type, the receiver first.
+    args: Vec<Type>,
+    returns: Option<Type>,
 }
 
 fn rayzor_abi_type(ty: &Type, result: bool) -> Result<u8, String> {
@@ -1671,6 +1772,14 @@ fn generate_parts(
             }
         }
     }
+    // Resources that import no WebIDL interface, which a tagged method's
+    // result may stand for.
+    let imported: HashSet<String> = idl_types.values().filter_map(type_name).collect();
+    let untagged: HashSet<String> = resources
+        .iter()
+        .filter(|r| !imported.contains(*r))
+        .cloned()
+        .collect();
     let mut names = HashSet::new();
     let mut output = TokenStream::new();
     let mut exports = TokenStream::new();
@@ -2296,24 +2405,20 @@ fn generate_parts(
                             .ok_or_else(|| format!("{class}.{name} needs #[native(function)]"))?
                             .parse_args::<syn::Ident>()
                             .map_err(error)?;
-                        if let Some(source) = idl_name(&f.attrs)? {
-                            let imported = operation_return(&idl, &source, &aliases, &idl_types)?;
+                        let member = idl_name(&f.attrs)?;
+                        if let Some(source) = &member {
                             let declared = match &f.sig.output {
                                 ReturnType::Default => syn::parse_quote!(()),
                                 ReturnType::Type(_, ty) => (**ty).clone(),
                             };
-                            if quote!(#imported).to_string() != quote!(#declared).to_string() {
-                                return Err(format!(
-                                    "{class}.{name} returns {}, but {source} maps to {}",
-                                    quote!(#declared),
-                                    quote!(#imported)
-                                ));
-                            }
+                            check_member(&idl, source, &aliases, &idl_types, &declared, &untagged)
+                                .map_err(|e| format!("{class}.{name}: {e}"))?;
                         }
                         let mut params = Vec::new();
                         let mut types = Vec::new();
                         let mut args = Vec::new();
                         let mut backend_types = Vec::new();
+                        let mut declared = Vec::new();
                         for (i, arg) in f.sig.inputs.iter().enumerate() {
                             let FnArg::Typed(arg) = arg else {
                                 return Err("use an explicit this: &Class receiver".into());
@@ -2358,6 +2463,7 @@ fn generate_parts(
                             params.push(quote!(#param: #ty));
                             types.push(quote!(#ty));
                             args.push(value);
+                            declared.push((**ty).clone());
                         }
                         // A panic in the backend becomes a runtime error in the
                         // caller's language, and the fallback is returned.
@@ -2389,6 +2495,7 @@ fn generate_parts(
                                     params: backend_types.clone(),
                                     ret: quote!(-> #ty),
                                     fallback: quote!(<#ty>::default()),
+                                    member: None,
                                 });
                             }
                             let value = quote! {
@@ -2518,6 +2625,15 @@ fn generate_parts(
                                 params: backend_types.clone(),
                                 ret,
                                 fallback: fallback.clone(),
+                                member: member.as_ref().map(|source| Member {
+                                    source: source.clone(),
+                                    class: class.clone(),
+                                    args: declared.clone(),
+                                    returns: match &f.sig.output {
+                                        ReturnType::Default => None,
+                                        ReturnType::Type(_, ty) => Some((**ty).clone()),
+                                    },
+                                }),
                             });
                         }
                         let body = if return_type.is_empty() {
@@ -2633,8 +2749,11 @@ fn generate_parts(
 
 /// A backend for a target that has only some of the backend's functions:
 /// each function `implemented` (the source of a module, `crate::web`)
-/// defines is forwarded to it, and every other one raises that it is not
-/// available and returns what a failed call returns.
+/// defines is forwarded to it. One it does not define whose method is
+/// tagged with a WebIDL member, `#[idl("GPUTexture.width")]`, is generated
+/// from that member over the module's `live`, `command`, `make`, `ask`,
+/// `promise` and `release` (see `forward`). Every other one raises that it
+/// is not available and returns what a failed call returns.
 pub fn web_backend(
     namespace: &str,
     declaration: Option<PathBuf>,
@@ -2691,12 +2810,14 @@ fn web_backend_for(
     let model = idl::parse(webidl)?;
     let (_, emitted) = wire::generate(&model);
     let mut out = convert::conversions(&plugin, &model, &emitted, &defined)?;
+    let values = convert::Values::new(&plugin, &model, &emitted);
     for b in &backend_fns {
         let BackendFn {
             name,
             params,
             ret,
             fallback,
+            member,
         } = b;
         let args: Vec<syn::Ident> = (0..params.len())
             .map(|i| quote::format_ident!("a{i}"))
@@ -2705,6 +2826,14 @@ fn web_backend_for(
             out.extend(quote! {
                 pub unsafe fn #name(#(#args: #params),*) #ret { unsafe { crate::web::#name(#(#args),*) } }
             });
+        } else if let Some(member) = member {
+            out.extend(forward::generate(
+                b,
+                member,
+                &model,
+                &values,
+                &plugin.resources,
+            )?);
         } else {
             let message = format!("{namespace}: `{name}` is not available on the web");
             out.extend(quote! {
@@ -3313,6 +3442,122 @@ mod test {
     }
 
     #[test]
+    fn a_tagged_method_the_web_module_lacks_is_generated_from_its_member() {
+        let idl = r#"
+          enum GPUTextureFormat { "r8unorm", "rgba8unorm" };
+          interface GPUTexture {
+            readonly attribute unsigned long width;
+            readonly attribute GPUTextureFormat format;
+            readonly attribute USVString label;
+            undefined destroy();
+          };
+          interface GPUSampler {};
+          interface GPURenderPipeline {};
+          interface GPURenderBundleEncoder {};
+          interface mixin GPURenderCommandsMixin {
+            undefined draw(unsigned long vertexCount, optional unsigned long instanceCount = 1);
+          };
+          GPURenderBundleEncoder includes GPURenderCommandsMixin;
+          dictionary GPUSamplerDescriptor { USVString label = ""; };
+          dictionary GPURenderPipelineDescriptor { required USVString entry; };
+          interface GPUDevice {
+            GPUSampler createSampler(optional GPUSamplerDescriptor descriptor = {});
+            Promise<GPURenderPipeline> createRenderPipelineAsync(GPURenderPipelineDescriptor descriptor);
+            undefined pushErrorScope(unsigned long filter);
+          };
+        "#;
+        let declaration = r#"
+          #[idl("GPUTextureFormat")] enum Format { R8unorm, Rgba8unorm }
+          #[idl("GPUSamplerDescriptor")] struct SamplerDescriptor {}
+          #[idl("GPURenderPipelineDescriptor")] struct PipelineDescriptor {}
+          #[idl("GPUSampler")] trait Sampler {}
+          trait Pipeline {}
+          #[idl("GPUTexture")]
+          trait Texture {
+              #[idl("GPUTexture.width")] #[native(texture_width)]
+              fn width(this: &Texture) -> i32;
+              #[idl("GPUTexture.format")] #[native(texture_format)]
+              fn format(this: &Texture) -> Enum<Format>;
+              #[idl("GPUTexture.label")] #[native(texture_label)]
+              fn label(this: &Texture) -> Text;
+              #[idl("GPUTexture.destroy")] #[native(texture_destroy)]
+              fn destroy(this: &Texture);
+          }
+          #[idl("GPURenderBundleEncoder")]
+          trait Bundle {
+              #[idl("GPURenderBundleEncoder.draw")] #[native(bundle_draw)]
+              fn draw(this: &Bundle, vertices: i32);
+          }
+          #[idl("GPUDevice")]
+          trait Device {
+              #[idl("GPUDevice.createSampler")] #[native(sampler_create)]
+              fn sampler(this: &Device, descriptor: &SamplerDescriptor) -> Box<Sampler>;
+              #[idl("GPUDevice.createRenderPipelineAsync")] #[native(pipeline_create_async)]
+              fn pipeline(this: &Device, descriptor: &PipelineDescriptor) -> Future<Pipeline>;
+              #[idl("GPUDevice.pushErrorScope")] #[native(error_scope_push)]
+              fn pushErrorScope(this: &Device, filter: i32);
+          }
+        "#;
+        let declaration_path = temp_dir().join(format!("forward-{}.api.rs", std::process::id()));
+        std::fs::write(&declaration_path, declaration).unwrap();
+        // A hand-written function wins over its member.
+        let web = "pub fn error_scope_push(device: i32, filter: i32) {}";
+        let generated = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap();
+        syn::parse_file(&generated).unwrap();
+        let flat = generated.replace(' ', "");
+        for expected in [
+            "if!crate::web::live(\"GPUTexture\",a0){return",
+            "crate::web::ask::<u32>(|e,reply|e.gpu_texture_get_width(crate::wire::Handle(a0asu32),reply))",
+            "Some(v)=>vasi32",
+            "crate::web::ask::<crate::wire::GPUTextureFormat>",
+            "Some(v)=>vasu32asi32",
+            "crate::web::ask::<String>",
+            "Some(v)=>crate::runtime::Text::new(&v)",
+            "crate::web::command(|e|e.gpu_texture_destroy(crate::wire::Handle(a0asu32)));crate::web::release(\"GPUTexture\",a0);",
+            // A mixin's member, its optional argument left out.
+            "if!crate::web::live(\"GPURenderBundleEncoder\",a0)",
+            "Ok((*(&a1)asu32,None,))",
+            "crate::web::make(\"GPUSampler\",|e,made|e.gpu_device_create_sampler(crate::wire::Handle(a0asu32),made,&w0))",
+            "Ok((Some(a1.wire()?),))",
+            // A resource importing no interface stands for the member's.
+            "crate::web::promise::<crate::Pipeline>(Some(\"GPURenderPipeline\"),",
+            "|future,handle|future.resolve_boxed(Box::new(crate::Pipeline{handle}))",
+            "pubunsafefnerror_scope_push(a0:i32,a1:i32){unsafe{crate::web::error_scope_push(a0,a1)}}",
+        ] {
+            assert!(flat.contains(expected), "{expected} in {generated}");
+        }
+
+        // A tag the web cannot follow is an error naming the remedy.
+        let bad = declaration.replace(
+            "fn draw(this: &Bundle, vertices: i32);",
+            "fn draw(this: &Bundle, vertices: i32, instances: i32, more: i32);",
+        );
+        std::fs::write(&declaration_path, bad).unwrap();
+        let error = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap_err();
+        assert!(
+            error.contains("Bundle.bundle_draw (GPURenderBundleEncoder.draw) cannot be generated"),
+            "{error}"
+        );
+        assert!(
+            error.contains("define `bundle_draw` in the web module, or untag it"),
+            "{error}"
+        );
+
+        // A tag whose member returns something else is refused when declared.
+        let wrong = declaration.replace(
+            "fn width(this: &Texture) -> i32;",
+            "fn width(this: &Texture) -> Text;",
+        );
+        std::fs::write(&declaration_path, wrong).unwrap();
+        let error = web_backend("gpu", Some(declaration_path.clone()), idl, web).unwrap_err();
+        assert!(
+            error.contains("Texture.width: returns Text, but GPUTexture.width maps to i32"),
+            "{error}"
+        );
+        std::fs::remove_file(declaration_path).ok();
+    }
+
+    #[test]
     fn a_web_backend_converts_records_to_the_wires_dictionaries() {
         let idl = r#"
           enum GPUFilterMode { "nearest", "linear" };
@@ -3334,6 +3579,10 @@ mod test {
             sequence<GPUResource> resources = [];
           };
           dictionary GPULaid { required (GPUPipelineLayout or GPUAutoLayoutMode) layout; };
+          dictionary GPUExtent3DDict { required unsigned long width; };
+          typedef (sequence<unsigned long> or GPUExtent3DDict) GPUExtent3D;
+          dictionary GPUSized { required GPUExtent3D size; };
+          interface GPUQueue { undefined size(GPUSized descriptor); };
         "#;
         let declaration = r#"
           #[idl("GPUFilterMode")] enum Filter { #[extension] Cubic }
@@ -3346,6 +3595,8 @@ mod test {
           enum Resource { Sampler(Sampler), Buffer(Buffer), Binding(Binding) }
           #[idl("GPUThing")] struct Thing { #[extension] native: Option<i32> }
           #[idl("GPULaid")] struct Laid { layout: Option<Layout> }
+          #[idl("GPUExtent3DDict")] struct Extent {}
+          #[idl("GPUSized")] struct Sized { size: Extent }
         "#;
         let declaration_path = temp_dir().join("gpu.api.rs");
         std::fs::write(&declaration_path, declaration)
@@ -3365,6 +3616,9 @@ mod test {
             "crate::Resource::Buffer(x)=>crate::wire::GPUResource::GPUBuffer(crate::wire::Handle(*xasu32))",
             "crate::Resource::Binding(x)=>crate::wire::GPUResource::GPUBinding(x.wire()?)",
             "layout:crate::web::laid_layout(&self.layout)?",
+            // An override pairs with the union alternative that is its
+            // dictionary.
+            "size:crate::wire::GPUExtent3D::GPUExtent3DDict((&self.size).wire()?)",
         ] {
             assert!(flat.contains(expected), "{expected} in {generated}");
         }

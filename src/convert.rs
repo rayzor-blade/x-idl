@@ -4,10 +4,11 @@
 //! with its dictionary member by type: numbers and booleans as they are, a
 //! text as a string, an imported enum by its IDL index (its native value),
 //! a resource by its handle, a record through its own `wire()`, sequences,
-//! nullables and unions item by item. A member the backend overrides, or
-//! one that does not pair, is converted by the web module's function named
+//! nullables and unions item by item; a record pairs with a union one of
+//! whose alternatives is its dictionary. The web module's function named
 //! after the record and member (`gpu_compute_pipeline_descriptor_layout`)
-//! when it defines one. A member the wire cannot carry makes the conversion
+//! converts that member instead when it defines one, as it must for a
+//! member that does not pair. A member the wire cannot carry makes the conversion
 //! fail when it is set, naming it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -71,27 +72,7 @@ pub(crate) fn conversions(
     emitted: &BTreeSet<String>,
     defined: &HashSet<String>,
 ) -> Result<TokenStream, String> {
-    let converted = plugin
-        .records
-        .iter()
-        .filter_map(|r| {
-            let source = r.source.as_ref()?;
-            emitted
-                .contains(source)
-                .then(|| (r.class.to_string(), source.clone()))
-        })
-        .collect();
-    let idl_of = plugin
-        .idl_types
-        .iter()
-        .map(|(idl, ty)| (quote!(#ty).to_string(), idl.clone()))
-        .collect();
-    let ctx = Ctx {
-        plugin,
-        model,
-        converted,
-        idl_of,
-    };
+    let ctx = Ctx::new(plugin, model, emitted);
     let mut out = TokenStream::new();
     for record in &plugin.records {
         let Some(source) = ctx.converted.get(&record.class.to_string()) else {
@@ -100,6 +81,63 @@ pub(crate) fn conversions(
         out.extend(ctx.record(record, source, defined));
     }
     Ok(out)
+}
+
+/// Converts a backend function's arguments to the wire's values as a
+/// record's members are converted.
+pub(crate) struct Values<'a>(Ctx<'a>);
+
+impl<'a> Values<'a> {
+    pub(crate) fn new(plugin: &'a Plugin, model: &'a Model, emitted: &BTreeSet<String>) -> Self {
+        Self(Ctx::new(plugin, model, emitted))
+    }
+
+    /// The expression turning `v`, a reference to a value declared as
+    /// `declared`, into the wire's value of `ty`; `None` when they do not
+    /// pair. It may return early with `Err(String)`.
+    pub(crate) fn value(
+        &self,
+        v: TokenStream,
+        declared: &Type,
+        ty: &Ty,
+        what: &str,
+    ) -> Option<TokenStream> {
+        self.0.value(v, declared, ty, what)
+    }
+
+    /// The WebIDL name a declared type was imported from.
+    pub(crate) fn idl_of(&self, declared: &Type) -> Option<&str> {
+        self.0
+            .idl_of
+            .get(&quote!(#declared).to_string())
+            .map(String::as_str)
+    }
+}
+
+impl<'a> Ctx<'a> {
+    fn new(plugin: &'a Plugin, model: &'a Model, emitted: &BTreeSet<String>) -> Self {
+        let converted = plugin
+            .records
+            .iter()
+            .filter_map(|r| {
+                let source = r.source.as_ref()?;
+                emitted
+                    .contains(source)
+                    .then(|| (r.class.to_string(), source.clone()))
+            })
+            .collect();
+        let idl_of = plugin
+            .idl_types
+            .iter()
+            .map(|(idl, ty)| (quote!(#ty).to_string(), idl.clone()))
+            .collect();
+        Ctx {
+            plugin,
+            model,
+            converted,
+            idl_of,
+        }
+    }
 }
 
 impl Ctx<'_> {
@@ -124,23 +162,21 @@ impl Ctx<'_> {
             let value = match found {
                 None if m.required => quote!(return Err(#unavailable.to_owned())),
                 None => quote!(None),
-                Some((name, ty, origin)) => {
+                Some((name, ty, _)) => {
                     let hook = format!(
                         "{}_{}",
                         wire::snake(&class.to_string()),
                         wire::snake(&m.name)
                     );
-                    let generated = if *origin == Origin::Override {
-                        None
-                    } else {
-                        self.member(
-                            quote!(self.#name),
-                            ty,
-                            &m.ty,
-                            m.required,
-                            &format!("{class}.{}", m.name),
-                        )
-                    };
+                    // An override pairs too when its type does: a record
+                    // for a union of which its dictionary is one alternative.
+                    let generated = self.member(
+                        quote!(self.#name),
+                        ty,
+                        &m.ty,
+                        m.required,
+                        &format!("{class}.{}", m.name),
+                    );
                     if defined.contains(&hook) {
                         let hook = format_ident!("{hook}");
                         quote!(crate::web::#hook(&self.#name)?)
@@ -294,6 +330,20 @@ impl Ctx<'_> {
                 let inner = generic(declared, "Option")?;
                 let x = self.value(quote!(x), &inner, t, what)?;
                 quote!(match #v { Some(x) => Some(#x), None => None })
+            }
+            // A value that is not a declared union is the first alternative
+            // it pairs with: a record for `(sequence<..> or Dict)`.
+            Ty::Union(_, alternatives)
+                if !name
+                    .as_ref()
+                    .is_some_and(|n| self.plugin.unions.contains_key(n)) =>
+            {
+                let wire_union = format_ident!("{}", wire::union_name(ty));
+                alternatives.iter().find_map(|a| {
+                    let x = self.paired(v.clone(), declared, a, what, true)?;
+                    let alternative = format_ident!("{}", wire::alternative_name(a));
+                    Some(quote!(crate::wire::#wire_union::#alternative(#x)))
+                })?
             }
             Ty::Union(_, alternatives) => {
                 let union = name?;

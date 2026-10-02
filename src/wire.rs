@@ -121,6 +121,78 @@ fn generate_posting(model: &Model, posted: &[&str]) -> Result<(Wire, BTreeSet<St
     ))
 }
 
+/// A WebIDL member as the wire carries it, for code that calls the
+/// encoder: its method, arguments, and what the call returns.
+pub(crate) struct Member {
+    /// The encoder's method, `gpu_texture_get_width`.
+    pub method: String,
+    /// Each argument's name, type, and whether the encoder takes it as an
+    /// `Option`.
+    pub args: Vec<(String, Ty, bool)>,
+    /// The interface the call makes, kept under a handle the caller passes.
+    pub makes: Option<String>,
+    /// Whether the call takes a reply record's address.
+    pub replies: bool,
+    pub promise: bool,
+    /// What the reply carries.
+    pub reply_ty: Ty,
+}
+
+/// Every overload of `idl` (`GPUTexture.width`, `GPUDevice.createSampler`)
+/// the wire carries; a mixin's members count as the including interface's.
+pub(crate) fn members(model: &Model, idl: &str) -> Vec<Member> {
+    operations(model)
+        .into_iter()
+        .filter(|op| op.idl == idl)
+        .map(|op| {
+            let made = |ty: &Ty| match ty {
+                Ty::Interface(name) => Some(name.clone()),
+                Ty::Nullable(inner) => match &**inner {
+                    Ty::Interface(name) => Some(name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let ret = model
+                .interfaces
+                .iter()
+                .find_map(|i| {
+                    let (interface, member) = idl.split_once('.')?;
+                    if i.name != interface {
+                        return None;
+                    }
+                    i.operations
+                        .iter()
+                        .find(|o| o.name == member)
+                        .map(|o| o.ret.clone())
+                        .or_else(|| {
+                            i.attributes
+                                .iter()
+                                .find(|a| a.name == member)
+                                .map(|a| a.ty.clone())
+                        })
+                })
+                .unwrap_or(Ty::Undefined);
+            let inner = match &ret {
+                Ty::Promise(inner) => (**inner).clone(),
+                other => other.clone(),
+            };
+            Member {
+                method: op.method,
+                args: op
+                    .args
+                    .into_iter()
+                    .map(|a| (a.name, a.ty, a.optional))
+                    .collect(),
+                makes: if op.makes { made(&inner) } else { None },
+                replies: op.replies,
+                promise: op.promise,
+                reply_ty: op.reply_ty,
+            }
+        })
+        .collect()
+}
+
 /// What a command does, as both halves name it.
 struct Op {
     /// `GPUDevice.createBuffer`, or `.get_label` for an attribute.
