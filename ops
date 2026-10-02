@@ -1,1 +1,1 @@
-{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":3,"timestamp":1790984278,"nonce":"i4AZARh53Kl68LJzVdXIgey4CCU=","message":"Fixed in d76721475f92e439dab2888f72a1c05ab41eb832. Caribou's side is caribou git-bug fcfa07e45d709f91bce766f9d6fd9e5ab16ee6d285436200089d840631e83f8f.","files":null}]}
+{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":4,"timestamp":1790984278,"nonce":"/7iAStxNXBKMu7PddF9BXh7mIk8=","status":2}]}
