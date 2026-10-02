@@ -1277,7 +1277,10 @@ fn hashlink_signature(
         Some("i64" | "u64") => Ok("l".into()),
         Some("Text") if result => Ok("B".into()),
         Some("Buffer") if result => Ok(format!("X{library}_buffer_result_")),
-        Some("Text" | "Buffer" | "BufferMut") => Ok("OBi_".into()),
+        // A String is its bytes then its length; a haxe.io.Bytes is its
+        // length then its bytes.
+        Some("Text") => Ok("OBi_".into()),
+        Some("Buffer" | "BufferMut") => Ok("OiB_".into()),
         Some(name) => Err(format!("unsupported HashLink ABI type {name}")),
         None => Err("unsupported composite HashLink ABI type".into()),
     }
@@ -1325,11 +1328,11 @@ fn hashlink_argument(
             quote!(unsafe { Text::from_hl(#name) }),
         )),
         Some("Buffer") => Ok((
-            quote!(#name: *mut hl_abi::vstring),
+            quote!(#name: *mut HlBytes),
             quote!(unsafe { Buffer::from_hl(#name) }),
         )),
         Some("BufferMut") => Ok((
-            quote!(#name: *mut hl_abi::vstring),
+            quote!(#name: *mut HlBytes),
             quote!(unsafe { BufferMut::from_hl(#name) }),
         )),
         Some("i32" | "u32" | "i64" | "u64" | "f32" | "f64" | "bool") => {
@@ -1399,6 +1402,7 @@ fn hashlink_registration(
     let file = syn::parse_file(model).map_err(error)?;
     let mut wrappers = TokenStream::new();
     let mut count = 0usize;
+    let mut returns_bytes = false;
     for item in file.items {
         let Item::Impl(item) = item else { continue };
         let Type::Path(class_path) = &*item.self_ty else {
@@ -1414,6 +1418,8 @@ fn hashlink_registration(
             if method.sig.abi.as_ref().is_none() {
                 continue;
             }
+            returns_bytes |= matches!(&method.sig.output,
+                ReturnType::Type(_, ty) if type_name(ty).as_deref() == Some("Buffer"));
             let method_name = method.sig.ident.unraw().to_string();
             let native_name = format!(
                 "{}_{}",
@@ -1460,6 +1466,47 @@ fn hashlink_registration(
     }
     if count == 0 {
         return Err("HashLink generation produced no primitives".into());
+    }
+    wrappers.extend(quote! {
+        /// A `haxe.io.Bytes` as HashLink lays it out, which a `Buffer`
+        /// argument arrives as.
+        #[repr(C)]
+        pub struct HlBytes {
+            pub t: *mut hl_abi::hl_type,
+            pub length: i32,
+            pub b: *mut u8,
+        }
+    });
+    if returns_bytes {
+        // What the Haxe surface's XidlBytes copies a Buffer result out with.
+        let len = format!("PX{library}_buffer_result__i");
+        let copy = format!("PX{library}_buffer_result_OiB__v");
+        wrappers.extend(quote! {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn __hl_buffer_result_len(
+                value: *mut runtime::Managed<Buffer>,
+            ) -> i32 {
+                if value.is_null() {
+                    return 0;
+                }
+                unsafe { runtime::managed_ref(value) }.len() as i32
+            }
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn __hl_buffer_result_copy(
+                value: *mut runtime::Managed<Buffer>,
+                out: *mut HlBytes,
+            ) {
+                if value.is_null() || out.is_null() {
+                    return;
+                }
+                let value = unsafe { runtime::managed_ref(value) };
+                let out = unsafe { &*out };
+                let len = value.len().min(out.length.max(0) as usize);
+                unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), out.b, len) };
+            }
+            hl_abi::define_prim!(hlp_buffer_result_len, __hl_buffer_result_len, #len);
+            hl_abi::define_prim!(hlp_buffer_result_copy, __hl_buffer_result_copy, #copy);
+        });
     }
     Ok(wrappers.to_string())
 }
@@ -3233,6 +3280,7 @@ mod test {
             trait Device {
                 #[native(open)] fn open(options: &Options) -> Box<Device>;
                 #[native(read)] fn read(this: &Device) -> Buffer;
+                #[native(write)] fn write(this: &Device, data: Buffer);
             }
         "#;
         let library = crate::Library("xwindow");
@@ -3241,6 +3289,10 @@ mod test {
             .unwrap();
         assert!(hashlink.contains("\"PXxwindow_Options__i\""));
         assert!(hashlink.contains("\"Pi_Xxwindow_buffer_result_\""));
+        // A Buffer argument is a haxe.io.Bytes: its length, then its bytes.
+        assert!(hashlink.contains("\"PiOiB__v\""));
+        assert!(hashlink.contains("a1 : * mut HlBytes"));
+        assert!(hashlink.contains("\"PXxwindow_buffer_result_OiB__v\""));
         let rayzor = library
             .generate_rayzor("window", make_declaration(api), "", &[])
             .unwrap();
