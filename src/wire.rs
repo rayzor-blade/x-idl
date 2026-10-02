@@ -21,8 +21,16 @@
 //! A reply record is four words: its state (0 pending, 1 done, 2
 //! rejected, 3 too small), the length written, and the address and
 //! capacity of the caller's buffer, which takes the result encoded as
-//! above (bytes as they are), or a rejection's message. The agent stores the state last and
-//! notifies it.
+//! above (bytes as they are), or a rejection's message. The agent stores
+//! the state last and notifies it.
+//!
+//! Two kinds of result do not come back as a value. A sequence of
+//! interfaces is kept under consecutive handles from one the plugin
+//! passes before the reply, and the reply carries how many. An operation
+//! answering with bytes the page owns, such as a mapped range, has a
+//! second command, `<method>_write`, taking the operation's arguments and
+//! then the plugin's bytes, which the agent writes into what the
+//! operation returns.
 //!
 //! The program hands batches of commands to the agent through a mailbox in
 //! its memory, which the agent serves; the plugin's `Mailbox` gives the
@@ -123,6 +131,9 @@ struct Op {
     args: Vec<ArgOp>,
     /// Kept under a handle the plugin chose: the interface the call makes.
     makes: bool,
+    /// A sequence of interfaces, kept under consecutive handles from one
+    /// the plugin chose; the reply carries how many.
+    keeps: bool,
     /// Whether the call has a reply record, and what the reply carries.
     replies: bool,
     promise: bool,
@@ -134,6 +145,9 @@ enum Call {
     Get(String),
     Set(String),
     Values,
+    /// The method's bytes result, filled with the plugin's bytes: the
+    /// operation's arguments, then the bytes.
+    Fill(String),
 }
 
 struct ArgOp {
@@ -157,7 +171,37 @@ fn operations(model: &Model) -> Vec<Op> {
                 String::new()
             };
             if let Some(op) = operation(model, i.name.as_str(), o, &suffix) {
+                // An operation answering with bytes the page owns (a mapped
+                // range) also writes the plugin's bytes into them.
+                let fill = (!op.promise && op.reply_ty == Ty::Bytes).then(|| {
+                    let mut args: Vec<ArgOp> = op
+                        .args
+                        .iter()
+                        .map(|a| ArgOp {
+                            name: a.name.clone(),
+                            ty: a.ty.clone(),
+                            optional: a.optional,
+                        })
+                        .collect();
+                    args.push(ArgOp {
+                        name: "bytes".into(),
+                        ty: Ty::Bytes,
+                        optional: false,
+                    });
+                    Op {
+                        idl: format!("{} =bytes", op.idl),
+                        method: format!("{}_write", op.method),
+                        call: Call::Fill(o.name.clone()),
+                        args,
+                        makes: false,
+                        keeps: false,
+                        replies: true,
+                        promise: false,
+                        reply_ty: Ty::Undefined,
+                    }
+                });
                 out.push(op);
+                out.extend(fill);
             }
         }
         for a in &i.attributes {
@@ -183,6 +227,7 @@ fn operations(model: &Model) -> Vec<Op> {
                         optional: false,
                     }],
                     makes: false,
+                    keeps: false,
                     replies: false,
                     promise: false,
                     reply_ty: Ty::Undefined,
@@ -239,11 +284,13 @@ fn result_op(interface: &str, name: &str, idl: &str, call: Call, args: Vec<ArgOp
     };
     let makes = matches!(&inner, Ty::Interface(_))
         || matches!(&inner, Ty::Nullable(t) if matches!(**t, Ty::Interface(_)));
+    let keeps = matches!(&inner, Ty::Sequence(t) if matches!(**t, Ty::Interface(_)));
     // What the reply's buffer carries: an interface is its handle's
-    // presence, when it may be absent.
+    // presence, when it may be absent; a sequence of them, their count.
     let reply_ty = match &inner {
         Ty::Interface(_) | Ty::Undefined => Ty::Undefined,
         Ty::Nullable(t) if matches!(**t, Ty::Interface(_)) => Ty::Boolean,
+        _ if keeps => Ty::Integer(Int::U32),
         other => other.clone(),
     };
     let replies = promise || reply_ty != Ty::Undefined;
@@ -253,6 +300,7 @@ fn result_op(interface: &str, name: &str, idl: &str, call: Call, args: Vec<ArgOp
         call,
         args,
         makes,
+        keeps,
         replies,
         promise,
         reply_ty,
@@ -481,6 +529,10 @@ impl Gen<'_> {
                 params.push_str(", result: Handle");
                 body.push_str("        result.encode(self);\n");
             }
+            if op.keeps {
+                params.push_str(", first: Handle");
+                body.push_str("        first.encode(self);\n");
+            }
             if op.replies {
                 params.push_str(", reply: u32");
                 body.push_str("        self.u32(reply);\n");
@@ -509,6 +561,9 @@ impl Gen<'_> {
             if op.makes {
                 js.push_str("    const result = r.u32();\n");
             }
+            if op.keeps {
+                js.push_str("    const first = r.u32();\n");
+            }
             if op.replies {
                 js.push_str("    const reply = r.u32();\n");
             }
@@ -528,13 +583,20 @@ impl Gen<'_> {
                 Call::Get(a) => format!("self{}", js_key(a)),
                 Call::Set(a) => format!("(self{} = {args})", js_key(a)),
                 Call::Values => "Array.from(self.values())".to_owned(),
+                Call::Fill(m) => {
+                    let (bytes, rest) = names.split_last().expect("the bytes argument");
+                    format!("into(self.{m}({})).set({bytes})", rest.join(", "))
+                }
             };
             let keep = if op.makes {
                 "if (v) wire.set(result, v); "
+            } else if op.keeps {
+                "v = Array.from(v); v.forEach((x, i) => wire.set(first + i, x)); "
             } else {
                 ""
             };
             let answer = match &op.reply_ty {
+                _ if op.keeps => "encode((w) => w.u32(v.length))".to_owned(),
                 Ty::Undefined => "null".to_owned(),
                 Ty::Bytes => "new Uint8Array(v)".to_owned(),
                 Ty::Boolean if op.makes => "encode((w) => w.u8(v ? 1 : 0))".to_owned(),
@@ -1254,6 +1316,11 @@ class Writer {
   str(v) { const b = toUtf8.encode(v); this.u32(b.length); for (const x of b) this.bytes.push(x); }
   seq(v, item) { const items = Array.from(v); this.u32(items.length); for (const x of items) item(x); }
   record(v, value) { const keys = Object.keys(v); this.u32(keys.length); for (const k of keys) { this.str(k); value(v[k]); } }
+}
+
+/// The bytes `v`, an ArrayBuffer or a view of one, to write into.
+function into(v) {
+  return ArrayBuffer.isView(v) ? new Uint8Array(v.buffer, v.byteOffset, v.byteLength) : new Uint8Array(v);
 }
 
 function encode(write) {
