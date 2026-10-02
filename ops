@@ -1,1 +1,1 @@
-{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":5,"timestamp":1790960750,"nonce":"VSvkw87A4qjfoEA51tF7dN78gxs=","added":["bug area:rayzor"],"removed":null}]}
+{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":3,"timestamp":1790979601,"nonce":"PqAuwoNR58H5RZbFLUbYJXXOtTA=","message":"Fixed in ae48a090ade3dcfc7f6506ba8296653a98ae8252. Callers pass the Haxe package to generate_rayzor_in; rayzor-gpu's switch is rayzor git-bug a2fc2c8.","files":null}]}
