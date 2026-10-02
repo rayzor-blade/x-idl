@@ -5,13 +5,14 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use quote::ToTokens;
+use syn::ext::IdentExt;
 use syn::{FnArg, GenericArgument, Item, PathArguments, ReturnType, TraitItem, Type};
 
 /// The native binding convention an extern set targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runtime {
-    /// HashLink HDLL symbols loaded from `xidl`; Promise results use Ash's
-    /// externally completable Future carrier.
+    /// HashLink HDLL symbols loaded from the binding's library; Promise
+    /// results use Ash's externally completable Future carrier.
     HashLink,
     /// Rayzor package methods and `rayzor.concurrent.Future<T>`.
     Rayzor,
@@ -24,8 +25,20 @@ pub struct File {
     pub source: String,
 }
 
-/// Emit the conventional Haxe extern surface for a runtime.
+/// Emit the conventional Haxe extern surface for a runtime, its natives in
+/// the `xidl` library.
 pub fn generate(
+    namespace: &str,
+    declaration: Option<PathBuf>,
+    webidl: &str,
+    runtime: Runtime,
+) -> Result<Vec<File>, String> {
+    generate_in("xidl", namespace, declaration, webidl, runtime)
+}
+
+/// As `generate`, its natives in `library` (see `crate::Library`).
+pub(crate) fn generate_in(
+    library: &str,
     namespace: &str,
     declaration: Option<PathBuf>,
     webidl: &str,
@@ -60,7 +73,7 @@ pub fn generate(
             "XidlBytes",
             r#"@:noCompletion
 class XidlBytes {
-	public static function take(value:hl.Abstract<"xidl_buffer_result">):haxe.io.Bytes {
+	public static function take(value:hl.Abstract<"LIBRARY_buffer_result">):haxe.io.Bytes {
 		if (value == null) return null;
 		var out = haxe.io.Bytes.alloc(XidlBytesNative.length(value));
 		XidlBytesNative.copy(value, out);
@@ -69,13 +82,13 @@ class XidlBytes {
 }
 
 private extern class XidlBytesNative {
-	@:hlNative("xidl", "buffer_result_len")
-	public static function length(value:hl.Abstract<"xidl_buffer_result">):Int;
-	@:hlNative("xidl", "buffer_result_copy")
-	public static function copy(value:hl.Abstract<"xidl_buffer_result">, out:haxe.io.Bytes):Void;
+	@:hlNative("LIBRARY", "buffer_result_len")
+	public static function length(value:hl.Abstract<"LIBRARY_buffer_result">):Int;
+	@:hlNative("LIBRARY", "buffer_result_copy")
+	public static function copy(value:hl.Abstract<"LIBRARY_buffer_result">, out:haxe.io.Bytes):Void;
 }
 "#
-            .to_owned(),
+            .replace("LIBRARY", library),
         ));
     }
     if let Ok(file) = file {
@@ -86,6 +99,14 @@ private extern class XidlBytesNative {
                         continue;
                     }
                     let name = item.ident.to_string();
+                    if let Some(declared) = plugin.variants.get(&name) {
+                        out.push(source(
+                            namespace,
+                            &name,
+                            variants_enum(&name, declared, runtime)?,
+                        ));
+                        continue;
+                    }
                     let mut variants = Vec::new();
                     let imported = super::idl_name(&item.attrs)?;
                     if let Some(source) = imported {
@@ -177,7 +198,7 @@ private extern class XidlBytesNative {
                         .get(&name)
                         .ok_or_else(|| format!("record {name} was not described"))?;
                     if runtime == Runtime::HashLink {
-                        out.push(hashlink_record(namespace, &name, record, &plugin)?);
+                        out.push(hashlink_record(library, namespace, &name, record, &plugin)?);
                         continue;
                     }
                     let mut required = Vec::new();
@@ -187,6 +208,7 @@ private extern class XidlBytesNative {
                         if let Some((key, value)) = pair(ty, "Map") {
                             let method = format!("add{}", super::pascal(&field));
                             methods.push(method_line(
+                                library,
                                 runtime,
                                 &name,
                                 &method,
@@ -218,6 +240,7 @@ private extern class XidlBytesNative {
                                         format!("{field}{variant}")
                                     };
                                     methods.push(method_line(
+                                        library,
                                         runtime,
                                         &name,
                                         &method,
@@ -228,6 +251,7 @@ private extern class XidlBytesNative {
                             } else if container == "sequence" {
                                 let method = format!("add{}", super::pascal(&field));
                                 methods.push(method_line(
+                                    library,
                                     runtime,
                                     &name,
                                     &method,
@@ -236,6 +260,7 @@ private extern class XidlBytesNative {
                                 ));
                             } else if container == "option" {
                                 methods.push(method_line(
+                                    library,
                                     runtime,
                                     &name,
                                     &field,
@@ -247,7 +272,7 @@ private extern class XidlBytesNative {
                             }
                         }
                     }
-                    let constructor = native(runtime, &name, "new");
+                    let constructor = native(library, runtime, &name, "new");
                     let mut body = format!(
                         "{}extern class {name} {{\n\t{constructor}\n\tpublic function new({});",
                         class_annotation(runtime, namespace, &name),
@@ -263,7 +288,9 @@ private extern class XidlBytesNative {
                 Item::Trait(item) => {
                     let name = item.ident.to_string();
                     if runtime == Runtime::HashLink {
-                        out.push(hashlink_resource(namespace, &name, &item)?);
+                        out.push(hashlink_resource(
+                            library, namespace, &name, &item, &plugin,
+                        )?);
                         continue;
                     }
                     let mut methods = Vec::new();
@@ -292,14 +319,50 @@ private extern class XidlBytesNative {
                             ReturnType::Default => "Void".to_owned(),
                             ReturnType::Type(_, ty) => hx_type(ty, runtime)?,
                         };
-                        let annotation = native(runtime, &name, &rust_name);
+                        let static_ = if instance { "" } else { "static " };
+                        if let Some((variants_name, declared)) =
+                            returned_variants(&method.sig.output, &plugin)
+                        {
+                            // The value is built here from its variant's index
+                            // and the fields the natives read back.
+                            let index = format!("{rust_name}Variant");
+                            methods.push(format!(
+                                "\t{}\n\tprivate {static_}function {index}({}):Int;",
+                                native(library, runtime, &name, &index),
+                                args.join(", ")
+                            ));
+                            for (variant, fields) in declared {
+                                for (field, ty) in fields {
+                                    let getter =
+                                        super::variant_getter(&method.sig.ident, variant, field);
+                                    methods.push(format!(
+                                        "\t{}\n\tprivate static function {getter}():{};",
+                                        native(library, runtime, &name, &getter),
+                                        hx_type(ty, runtime)?
+                                    ));
+                                }
+                            }
+                            let names = arg_names(&args);
+                            let switch = variant_switch(
+                                &variants_name,
+                                declared,
+                                &method.sig.ident,
+                                &format!("{index}({names})"),
+                                |getter, _| format!("{getter}()"),
+                            );
+                            methods.push(format!(
+                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n{switch}\t}}",
+                                args.join(", ")
+                            ));
+                            continue;
+                        }
+                        let annotation = native(library, runtime, &name, &rust_name);
                         if rust_name == "new" {
                             methods.push(format!(
                                 "\t{annotation}\n\tpublic function new({});",
                                 args.join(", ")
                             ));
                         } else {
-                            let static_ = if instance { "" } else { "static " };
                             methods.push(format!(
                                 "\t{annotation}\n\tpublic {static_}function {rust_name}({}):{ret};",
                                 args.join(", ")
@@ -321,6 +384,7 @@ private extern class XidlBytesNative {
 }
 
 fn hashlink_record(
+    library: &str,
     namespace: &str,
     name: &str,
     record: &super::convert::Record,
@@ -367,7 +431,7 @@ fn hashlink_record(
             required.push((field, value));
         }
     }
-    let abstract_ty = format!("hl.Abstract<\"xidl_{name}\">");
+    let abstract_ty = format!("hl.Abstract<\"{library}_{name}\">");
     let args = haxe_args(&required, Runtime::HashLink)?;
     let names = required
         .iter()
@@ -379,7 +443,7 @@ fn hashlink_record(
     );
     let mut native_class = format!(
         "private extern class {name}Native {{\n\t{}\n\tpublic static function create({args}):{abstract_ty};",
-        native(Runtime::HashLink, name, "new"),
+        native(library, Runtime::HashLink, name, "new"),
     );
     for (method, params) in methods {
         let args = haxe_args(&params, Runtime::HashLink)?;
@@ -394,7 +458,7 @@ fn hashlink_record(
         ));
         native_class.push_str(&format!(
             "\n\t{}\n\tpublic static function {method}(self:{abstract_ty}{comma}{args}):Void;",
-            native(Runtime::HashLink, name, &method),
+            native(library, Runtime::HashLink, name, &method),
         ));
     }
     public.push_str("\n}\n\n");
@@ -402,9 +466,16 @@ fn hashlink_record(
     Ok(source(namespace, name, format!("{public}{native_class}")))
 }
 
-fn hashlink_resource(namespace: &str, name: &str, item: &syn::ItemTrait) -> Result<File, String> {
+fn hashlink_resource(
+    library: &str,
+    namespace: &str,
+    name: &str,
+    item: &syn::ItemTrait,
+    plugin: &super::convert::Plugin,
+) -> Result<File, String> {
     let mut public = format!("abstract {name}(Int) from Int to Int {{");
     let mut native_class = format!("private extern class {name}Native {{");
+    let mut text_getters = false;
     for entry in &item.items {
         let TraitItem::Fn(method) = entry else {
             continue;
@@ -435,9 +506,61 @@ fn hashlink_resource(namespace: &str, name: &str, item: &syn::ItemTrait) -> Resu
             ReturnType::Type(_, ty) => (**ty).clone(),
         };
         let ret = hx_type(&ret_ty, Runtime::HashLink)?;
+        if let Some((variants_name, declared)) = returned_variants(&method.sig.output, plugin) {
+            let index = format!("{rust_name}Variant");
+            let native_args = if instance {
+                if args.is_empty() {
+                    "self:Int".to_owned()
+                } else {
+                    format!("self:Int, {args}")
+                }
+            } else {
+                args.clone()
+            };
+            native_class.push_str(&format!(
+                "\n\t{}\n\tpublic static function {index}({native_args}):Int;",
+                native(library, Runtime::HashLink, name, &index),
+            ));
+            for (variant, fields) in declared {
+                for (field, ty) in fields {
+                    let getter = super::variant_getter(&method.sig.ident, variant, field);
+                    let native_ty = match simple_name(ty).as_deref() {
+                        Some("Text") => {
+                            text_getters = true;
+                            "hl.Bytes".to_owned()
+                        }
+                        _ => hx_type(ty, Runtime::HashLink)?,
+                    };
+                    native_class.push_str(&format!(
+                        "\n\t{}\n\tpublic static function {getter}():{native_ty};",
+                        native(library, Runtime::HashLink, name, &getter),
+                    ));
+                }
+            }
+            let call_args = match (instance, names.is_empty()) {
+                (true, true) => "this".to_owned(),
+                (true, false) => format!("this, {names}"),
+                (false, _) => names.clone(),
+            };
+            let switch = variant_switch(
+                &variants_name,
+                declared,
+                &method.sig.ident,
+                &format!("{name}Native.{index}({call_args})"),
+                |getter, ty| match simple_name(ty).as_deref() {
+                    Some("Text") => format!("text({name}Native.{getter}())"),
+                    _ => format!("{name}Native.{getter}()"),
+                },
+            );
+            let static_ = if instance { "" } else { "static " };
+            public.push_str(&format!(
+                "\n\tpublic {static_}inline function {rust_name}({args}):{ret} {{\n{switch}\t}}"
+            ));
+            continue;
+        }
         let native_ret = match simple_name(&ret_ty).as_deref() {
             Some("Text") => "hl.Bytes".to_owned(),
-            Some("Buffer") => "hl.Abstract<\"xidl_buffer_result\">".to_owned(),
+            Some("Buffer") => format!("hl.Abstract<\"{library}_buffer_result\">"),
             _ => ret.clone(),
         };
         let native_args = if instance {
@@ -456,7 +579,7 @@ fn hashlink_resource(namespace: &str, name: &str, item: &syn::ItemTrait) -> Resu
         };
         native_class.push_str(&format!(
             "\n\t{}\n\tpublic static function {native_method}({native_args}):{native_ret};",
-            native(Runtime::HashLink, name, &rust_name),
+            native(library, Runtime::HashLink, name, &rust_name),
         ));
         let call_args = if instance {
             if names.is_empty() {
@@ -489,9 +612,82 @@ fn hashlink_resource(namespace: &str, name: &str, item: &syn::ItemTrait) -> Resu
             ));
         }
     }
+    if text_getters {
+        public.push_str(
+            "\n\tstatic inline function text(value:hl.Bytes):String {\n\t\treturn value == null ? null : @:privateAccess String.fromUCS2(value);\n\t}",
+        );
+    }
     public.push_str("\n}\n\n");
     native_class.push_str("\n}\n");
     Ok(source(namespace, name, format!("{public}{native_class}")))
+}
+
+/// The declared variants a method returns, and their type's name.
+fn returned_variants<'p>(
+    output: &ReturnType,
+    plugin: &'p super::convert::Plugin,
+) -> Option<(String, &'p super::Variants)> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let name = simple_name(ty)?;
+    plugin.variants.get(&name).map(|declared| (name, declared))
+}
+
+/// A Haxe enum of the declared variants, each with its fields.
+fn variants_enum(
+    name: &str,
+    declared: &super::Variants,
+    runtime: Runtime,
+) -> Result<String, String> {
+    let mut body = Vec::new();
+    for (variant, fields) in declared {
+        if fields.is_empty() {
+            body.push(format!("\t{variant};"));
+            continue;
+        }
+        let fields = fields
+            .iter()
+            .map(|(field, ty)| Ok(format!("{}:{}", field.unraw(), hx_type(ty, runtime)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        body.push(format!("\t{variant}({});", fields.join(", ")));
+    }
+    Ok(format!("enum {name} {{\n{}\n}}\n", body.join("\n")))
+}
+
+/// The body that builds a `name` from `index`, the call returning its
+/// variant's index, and `read`, which reads one field through its getter.
+fn variant_switch(
+    name: &str,
+    declared: &super::Variants,
+    method: &syn::Ident,
+    index: &str,
+    read: impl Fn(&str, &Type) -> String,
+) -> String {
+    let mut arms = String::new();
+    for (at, (variant, fields)) in declared.iter().enumerate().skip(1) {
+        let value = if fields.is_empty() {
+            format!("{name}.{variant}")
+        } else {
+            let values = fields
+                .iter()
+                .map(|(field, ty)| read(&super::variant_getter(method, variant, field), ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name}.{variant}({values})")
+        };
+        arms.push_str(&format!("\t\t\tcase {at}: {value};\n"));
+    }
+    let fallback = &declared[0].0;
+    format!("\t\treturn switch ({index}) {{\n{arms}\t\t\tdefault: {name}.{fallback};\n\t\t}}\n")
+}
+
+/// The names in a Haxe parameter list, `a:Int, b:Float` as `a, b`.
+fn arg_names(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| arg.split(':').next().unwrap_or(arg))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn haxe_args(args: &[(String, Type)], runtime: Runtime) -> Result<String, String> {
@@ -510,10 +706,17 @@ fn source(namespace: &str, name: &str, body: String) -> File {
     }
 }
 
-fn method_line(runtime: Runtime, class: &str, method: &str, args: &str, ret: &str) -> String {
+fn method_line(
+    library: &str,
+    runtime: Runtime,
+    class: &str,
+    method: &str,
+    args: &str,
+    ret: &str,
+) -> String {
     format!(
         "\t{}\n\tpublic function {method}({args}):{ret};",
-        native(runtime, class, method)
+        native(library, runtime, class, method)
     )
 }
 
@@ -524,11 +727,11 @@ fn class_annotation(runtime: Runtime, namespace: &str, class: &str) -> String {
     }
 }
 
-fn native(runtime: Runtime, class: &str, method: &str) -> String {
+fn native(library: &str, runtime: Runtime, class: &str, method: &str) -> String {
     let symbol = format!("{}_{}", snake(class), snake(method));
     match runtime {
-        Runtime::HashLink => format!("@:hlNative(\"xidl\", \"{symbol}\")"),
-        Runtime::Rayzor => format!("@:native(\"xidl_{symbol}\")"),
+        Runtime::HashLink => format!("@:hlNative(\"{library}\", \"{symbol}\")"),
+        Runtime::Rayzor => format!("@:native(\"{library}_{symbol}\")"),
     }
 }
 

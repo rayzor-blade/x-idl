@@ -21,7 +21,7 @@ use crate::wire;
 use crate::{generic, generic_pair, type_name};
 
 /// Where a record's member came from.
-#[derive(Debug, Clone,  Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     /// The WebIDL dictionary, as it declares it.
     Imported,
@@ -50,6 +50,8 @@ pub(crate) struct Plugin {
     pub idl_types: HashMap<String, Type>,
     /// The plugin's resource classes.
     pub resources: HashSet<String>,
+    /// Each declared variants type's variants and their fields.
+    pub variants: HashMap<String, crate::Variants>,
 }
 
 struct Ctx<'a> {

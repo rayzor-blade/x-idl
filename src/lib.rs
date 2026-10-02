@@ -55,7 +55,6 @@ fn extension(attrs: &[syn::Attribute]) -> Result<bool, String> {
 /// identifier, which `plugin!` exports without the `r#`.
 fn ident(name: &str) -> Result<syn::Ident, String> {
     syn::parse_str(name).or_else(|e| {
-        println!("Failed to parse identifier '{}': {}", name, e); // Debugging line
         let raw = !matches!(name, "self" | "Self" | "super" | "crate" | "_")
             && syn::parse_str::<syn::Ident>(&format!("r#{name}")).is_ok();
         if raw {
@@ -474,6 +473,88 @@ fn dictionary_fields(
     }
     Ok(fields)
 }
+/// Declared variants: each variant's name and its named fields, in order.
+pub(crate) type Variants = Vec<(syn::Ident, Vec<(syn::Ident, Type)>)>;
+
+/// The variants `e` declares. The first has no fields: it is what a failed
+/// call returns. A field is a number, a bool, `Text` or an `Enum`.
+fn declared_variants(e: &syn::ItemEnum) -> Result<Variants, String> {
+    let name = &e.ident;
+    if !e.generics.params.is_empty() {
+        return Err(format!("variants {name} cannot be generic"));
+    }
+    let mut out = Vec::new();
+    for (at, v) in e.variants.iter().enumerate() {
+        if v.discriminant.is_some() || extension(&v.attrs)? {
+            return Err(format!(
+                "{name}::{} takes no value or #[extension]",
+                v.ident
+            ));
+        }
+        let fields = match &v.fields {
+            syn::Fields::Unit => Vec::new(),
+            syn::Fields::Named(fields) => fields
+                .named
+                .iter()
+                .map(|f| (f.ident.clone().expect("a named field"), f.ty.clone()))
+                .collect(),
+            syn::Fields::Unnamed(_) => {
+                return Err(format!("{name}::{} names its fields", v.ident));
+            }
+        };
+        if at == 0 && !fields.is_empty() {
+            return Err(format!(
+                "{name}::{} is what a failed call returns, so has no fields",
+                v.ident
+            ));
+        }
+        for (field, ty) in &fields {
+            let carried = generic(ty, "Enum").is_some()
+                || matches!(
+                    type_name(ty).as_deref(),
+                    Some("i32" | "i64" | "f32" | "f64" | "bool" | "Text")
+                );
+            if !carried {
+                return Err(format!(
+                    "{name}::{}.{field} is not a number, bool, Text or Enum",
+                    v.ident
+                ));
+            }
+        }
+        out.push((v.ident.clone(), fields));
+    }
+    if out.is_empty() {
+        return Err(format!("empty variants {name}"));
+    }
+    Ok(out)
+}
+
+/// A variant field as its enum holds it: text as a `String`, an enum as
+/// its value.
+fn variant_storage(ty: &Type) -> TokenStream {
+    if let Some(enumeration) = generic(ty, "Enum") {
+        quote!(#enumeration)
+    } else if type_name(ty).as_deref() == Some("Text") {
+        quote!(String)
+    } else {
+        quote!(#ty)
+    }
+}
+
+/// The getter that reads `field` of `variant` from what `method` last
+/// returned, on runtimes that build the value in the language.
+pub(crate) fn variant_getter(
+    method: &syn::Ident,
+    variant: &syn::Ident,
+    field: &syn::Ident,
+) -> String {
+    format!(
+        "{}{variant}{}",
+        method.unraw(),
+        pascal(&field.unraw().to_string())
+    )
+}
+
 /// An integer literal discriminant, possibly negative.
 fn discriminant(expr: &syn::Expr) -> Option<i32> {
     match expr {
@@ -672,6 +753,94 @@ pub fn generate_caribou(
     .map(|(code, _, _)| code)
 }
 
+/// The native library a binding's symbols live in: the HashLink library its
+/// Haxe surface loads (`<name>.hdll`, or `<name>.wasm` under Ash), the tag
+/// of its records' HashLink abstracts, and the prefix of its Rayzor symbols.
+/// Two bindings one program loads each need their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Library<'a>(pub &'a str);
+
+impl<'a> Library<'a> {
+    /// The library of the functions that take no library.
+    pub const XIDL: Library<'static> = Library("xidl");
+
+    fn name(self) -> Result<&'a str, String> {
+        let valid = self.0.starts_with(|c: char| c.is_ascii_alphabetic())
+            && self
+                .0
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(format!(
+                "library name {:?} is not [A-Za-z][A-Za-z0-9_]*",
+                self.0
+            ));
+        }
+        Ok(self.0)
+    }
+
+    /// Emit the runtime-neutral model and HashLink primitive resolvers used
+    /// by the plugin. Resources cross as integer handles, records as
+    /// GC-finalized native abstracts, and Promise results as Ash Future
+    /// carriers.
+    pub fn generate_hashlink(
+        self,
+        namespace: &str,
+        declaration: Option<PathBuf>,
+        webidl: &str,
+    ) -> Result<String, String> {
+        let library = self.name()?;
+        let (model, _, plugin) = generate_parts(
+            namespace,
+            declaration,
+            webidl,
+            RustTarget::HashLink,
+            &HashSet::new(),
+        )?;
+        let registration = hashlink_registration(&model, &plugin, library)?;
+        Ok(format!("{model} {registration}"))
+    }
+
+    /// Generate Rayzor bindings, letting its adapter own the resource
+    /// wrappers named in `adapter_resources`. This is how runtime extensions
+    /// attach metadata to a handle without creating a second language object
+    /// for the same resource.
+    pub fn generate_rayzor(
+        self,
+        namespace: &str,
+        declaration: Option<PathBuf>,
+        webidl: &str,
+        adapter_resources: &[&str],
+    ) -> Result<String, String> {
+        let library = self.name()?;
+        let adapter_resources = adapter_resources
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        let (model, _, _) = generate_parts(
+            namespace,
+            declaration,
+            webidl,
+            RustTarget::Rayzor,
+            &adapter_resources,
+        )?;
+        let registration = rayzor_registration(namespace, &model, library)?;
+        Ok(format!("{model} {registration}"))
+    }
+
+    /// The conventional Haxe surface for one runtime, its natives in this
+    /// library.
+    pub fn haxe(
+        self,
+        namespace: &str,
+        declaration: Option<PathBuf>,
+        webidl: &str,
+        runtime: haxe::Runtime,
+    ) -> Result<Vec<haxe::File>, String> {
+        haxe::generate_in(self.name()?, namespace, declaration, webidl, runtime)
+    }
+}
+
 /// Emit the runtime-neutral model and exported C symbols used by Rayzor's
 /// native package. The adapter supplies Text, Buffer, roots, futures, errors,
 /// and the generic Enum carrier; xidl supplies the object model and backend.
@@ -683,47 +852,23 @@ pub fn generate_rayzor(
     generate_rayzor_with_resources(namespace, declaration, webidl, &[])
 }
 
-/// Emit the runtime-neutral model and HashLink primitive resolvers used by
-/// the plugin. Resources cross as integer handles, records as GC-finalized native
-/// abstracts, and Promise results as Ash Future carriers.
+/// `Library::generate_hashlink` in the `xidl` library.
 pub fn generate_hashlink(
     namespace: &str,
     declaration: Option<PathBuf>,
     webidl: &str,
 ) -> Result<String, String> {
-    let (model, _, plugin) = generate_parts(
-        namespace,
-        declaration,
-        webidl,
-        RustTarget::HashLink,
-        &HashSet::new(),
-    )?;
-    let registration = hashlink_registration(&model, &plugin)?;
-    Ok(format!("{model} {registration}"))
+    Library::XIDL.generate_hashlink(namespace, declaration, webidl)
 }
 
-/// Generate Rayzor bindings while letting its adapter own selected resource
-/// wrappers. This is how runtime extensions attach metadata to an xidl handle
-/// without creating a second language object for the same GPU resource.
+/// `Library::generate_rayzor` in the `xidl` library.
 pub fn generate_rayzor_with_resources(
     namespace: &str,
     declaration: Option<PathBuf>,
     webidl: &str,
     adapter_resources: &[&str],
 ) -> Result<String, String> {
-    let adapter_resources = adapter_resources
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    let (model, _, _) = generate_parts(
-        namespace,
-        declaration,
-        webidl,
-        RustTarget::Rayzor,
-        &adapter_resources,
-    )?;
-    let registration = rayzor_registration(namespace, &model)?;
-    Ok(format!("{model} {registration}"))
+    Library::XIDL.generate_rayzor(namespace, declaration, webidl, adapter_resources)
 }
 
 /// Compatibility spelling for existing Caribou build scripts.
@@ -848,7 +993,7 @@ fn rayzor_return(
 /// Describe every generated C export to Rayzor's compiler and return the same
 /// function pointers to its runtime linker. This is derived from the emitted
 /// model so the externs, method table and actual symbols cannot drift apart.
-fn rayzor_registration(namespace: &str, model: &str) -> Result<String, String> {
+fn rayzor_registration(namespace: &str, model: &str, library: &str) -> Result<String, String> {
     let file = syn::parse_file(model).map_err(error)?;
     let mut descriptors = TokenStream::new();
     let mut symbols = TokenStream::new();
@@ -876,7 +1021,7 @@ fn rayzor_registration(namespace: &str, model: &str) -> Result<String, String> {
                 continue;
             }
             let symbol = format!(
-                "xidl_{}_{}",
+                "{library}_{}_{}",
                 haxe::snake(&class.to_string()),
                 haxe::snake(&method.sig.ident.unraw().to_string())
             );
@@ -957,14 +1102,19 @@ fn rayzor_registration(namespace: &str, model: &str) -> Result<String, String> {
     .to_string())
 }
 
-fn hashlink_signature(ty: &Type, result: bool, plugin: &convert::Plugin) -> Result<String, String> {
+fn hashlink_signature(
+    ty: &Type,
+    result: bool,
+    plugin: &convert::Plugin,
+    library: &str,
+) -> Result<String, String> {
     if let Type::Reference(reference) = ty {
         let name = type_name(&reference.elem).ok_or("HashLink references need named types")?;
         if plugin.resources.contains(&name) {
             return Ok("i".into());
         }
         if plugin.records.iter().any(|record| record.class == name) {
-            return Ok(format!("Xxidl_{name}_"));
+            return Ok(format!("X{library}_{name}_"));
         }
         return Err(format!("unsupported HashLink reference {name}"));
     }
@@ -978,7 +1128,7 @@ fn hashlink_signature(ty: &Type, result: bool, plugin: &convert::Plugin) -> Resu
         return if plugin.resources.contains(&name) {
             Ok("i".into())
         } else if plugin.records.iter().any(|record| record.class == name) {
-            Ok(format!("Xxidl_{name}_"))
+            Ok(format!("X{library}_{name}_"))
         } else {
             Err(format!("unsupported HashLink box {name}"))
         };
@@ -996,7 +1146,7 @@ fn hashlink_signature(ty: &Type, result: bool, plugin: &convert::Plugin) -> Resu
         Some("i32" | "u32") => Ok("i".into()),
         Some("i64" | "u64") => Ok("l".into()),
         Some("Text") if result => Ok("B".into()),
-        Some("Buffer") if result => Ok("xidl_buffer_result_".into()),
+        Some("Buffer") if result => Ok(format!("X{library}_buffer_result_")),
         Some("Text" | "Buffer" | "BufferMut") => Ok("OBi_".into()),
         Some(name) => Err(format!("unsupported HashLink ABI type {name}")),
         None => Err("unsupported composite HashLink ABI type".into()),
@@ -1111,7 +1261,11 @@ fn hashlink_return(
 
 /// Derive every `DEFINE_PRIM` resolver from the generated typed model so its
 /// signature and the Haxe surface cannot drift apart.
-fn hashlink_registration(model: &str, plugin: &convert::Plugin) -> Result<String, String> {
+fn hashlink_registration(
+    model: &str,
+    plugin: &convert::Plugin,
+    library: &str,
+) -> Result<String, String> {
     let file = syn::parse_file(model).map_err(error)?;
     let mut wrappers = TokenStream::new();
     let mut count = 0usize;
@@ -1146,7 +1300,7 @@ fn hashlink_registration(model: &str, plugin: &convert::Plugin) -> Result<String
                 let FnArg::Typed(arg) = arg else {
                     return Err("generated HashLink functions use typed parameters".into());
                 };
-                signature.push_str(&hashlink_signature(&arg.ty, false, plugin)?);
+                signature.push_str(&hashlink_signature(&arg.ty, false, plugin, library)?);
                 let name = quote::format_ident!("a{at}");
                 let (parameter, converted) = hashlink_argument(&name, &arg.ty, plugin)?;
                 params.push(parameter);
@@ -1156,7 +1310,7 @@ fn hashlink_registration(model: &str, plugin: &convert::Plugin) -> Result<String
             match &method.sig.output {
                 ReturnType::Default => signature.push('v'),
                 ReturnType::Type(_, ty) => {
-                    signature.push_str(&hashlink_signature(ty, true, plugin)?)
+                    signature.push_str(&hashlink_signature(ty, true, plugin, library)?)
                 }
             }
             let call = quote!(#class::#function(#(#args),*));
@@ -1196,10 +1350,12 @@ fn generate_parts(
         String::new()
     };
 
-    let file = syn::parse_file(&desc_content);
+    let file = syn::parse_file(&desc_content).map_err(error);
+    if let Err(e) = &file {
+        return Err(format!("declaration: {e}"));
+    }
     let idl = tokens(webidl)?;
     let aliases = typedefs(&idl);
-
 
     let classes: HashSet<_> = if let Ok(file) = &file {
         file.items
@@ -1240,12 +1396,26 @@ fn generate_parts(
     // value. Each variant holds exactly one declared type.
     let mut unions: HashMap<String, Vec<(syn::Ident, Type)>> = HashMap::new();
     let mut union_extensions: HashSet<(String, String)> = HashSet::new();
+    // An enum with a variant of named fields declares variants: a value of
+    // one of several shapes, which a resource method returns.
+    let mut variants: HashMap<String, Variants> = HashMap::new();
     if let Ok(file) = &file {
         for item in &file.items {
             let Item::Enum(e) = item else { continue };
             if e.variants
                 .iter()
-                .all(|v| matches!(v.fields, syn::Fields::Unit))
+                .any(|v| matches!(v.fields, syn::Fields::Named(_)))
+            {
+                variants.insert(e.ident.to_string(), declared_variants(e)?);
+                continue;
+            }
+        }
+        for item in &file.items {
+            let Item::Enum(e) = item else { continue };
+            if variants.contains_key(&e.ident.to_string())
+                || e.variants
+                    .iter()
+                    .all(|v| matches!(v.fields, syn::Fields::Unit))
             {
                 continue;
             }
@@ -1276,7 +1446,10 @@ fn generate_parts(
         file.items
             .iter()
             .filter_map(|i| match i {
-                Item::Enum(e) if !unions.contains_key(&e.ident.to_string()) => {
+                Item::Enum(e)
+                    if !unions.contains_key(&e.ident.to_string())
+                        && !variants.contains_key(&e.ident.to_string()) =>
+                {
                     Some(e.ident.to_string())
                 }
                 _ => None,
@@ -1289,6 +1462,12 @@ fn generate_parts(
     if let Ok(file) = &file {
         for item in &file.items {
             let (attrs, ty): (&[syn::Attribute], Type) = match item {
+                Item::Enum(item) if variants.contains_key(&item.ident.to_string()) => {
+                    if idl_name(&item.attrs)?.is_some() {
+                        return Err(format!("variants {} are not imported", item.ident));
+                    }
+                    continue;
+                }
                 Item::Enum(item) if unions.contains_key(&item.ident.to_string()) => {
                     let local = &item.ident;
                     (item.attrs.as_slice(), syn::parse_quote!(#local))
@@ -1335,6 +1514,57 @@ fn generate_parts(
                 return Err(format!("duplicate export {name}"));
             }
             match item {
+                Item::Enum(e) if variants.contains_key(&e.ident.to_string()) => {
+                    let name = &e.ident;
+                    let schema = format!("{namespace}.{name}");
+                    let declared = &variants[&name.to_string()];
+                    let mut shapes = Vec::new();
+                    let mut indices = Vec::new();
+                    for (at, (variant, fields)) in declared.iter().enumerate() {
+                        let at =
+                            proc_macro2::Literal::i32_unsuffixed(i32::try_from(at).map_err(error)?);
+                        let default = if shapes.is_empty() {
+                            quote!(#[default])
+                        } else {
+                            quote!()
+                        };
+                        if fields.is_empty() {
+                            shapes.push(quote!(#default #variant));
+                            indices.push(quote!(Self::#variant => #at));
+                            continue;
+                        }
+                        let mut stored = Vec::new();
+                        for (field, ty) in fields {
+                            if let Some(enumeration) = generic(ty, "Enum")
+                                && !enums.contains(&type_name(&enumeration).unwrap_or_default())
+                            {
+                                return Err(format!("unknown enum in {name}::{variant}.{field}"));
+                            }
+                            let ty = variant_storage(ty);
+                            stored.push(quote!(#field: #ty));
+                        }
+                        shapes.push(quote!(#variant { #(#stored),* }));
+                        indices.push(quote!(Self::#variant { .. } => #at));
+                    }
+                    let derive = if target == RustTarget::Caribou {
+                        quote! {
+                            #[derive(Debug, Clone, PartialEq, Default, caribou_abi::PluginEnum)]
+                            #[caribou(name = #schema)]
+                        }
+                    } else {
+                        quote!(#[derive(Debug, Clone, PartialEq, Default)])
+                    };
+                    output.extend(quote! {
+                        #derive
+                        pub enum #name { #(#shapes),* }
+                        impl #name {
+                            /// The variant's position in the declaration.
+                            #[allow(dead_code)]
+                            pub fn variant(&self) -> i32 { match self { #(#indices),* } }
+                        }
+                    });
+                    exports.extend(quote!(enum #name;));
+                }
                 Item::Enum(e) if unions.contains_key(&e.ident.to_string()) => {
                     let name = &e.ident;
                     let alternatives = &unions[&name.to_string()];
@@ -1854,6 +2084,7 @@ fn generate_parts(
                     }
                     let mut methods = TokenStream::new();
                     let mut signatures = TokenStream::new();
+                    let mut statics = TokenStream::new();
                     let mut names = HashSet::new();
                     for method in &t.items {
                         let TraitItem::Fn(f) = method else {
@@ -1941,6 +2172,116 @@ fn generate_parts(
                             types.push(quote!(#ty));
                             args.push(value);
                         }
+                        // A panic in the backend becomes a runtime error in the
+                        // caller's language, and the fallback is returned.
+                        let call = quote! {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                                backend::#native(#(#args),*)
+                            }))
+                        };
+                        let raise_call = if target == RustTarget::Caribou {
+                            quote!(caribou_abi::host::raise(
+                                caribou_abi::ErrorKind::Runtime,
+                                message
+                            ))
+                        } else {
+                            quote!(host::raise(ErrorKind::Runtime, message))
+                        };
+                        let raise = quote! {
+                            let message = error.downcast_ref::<String>().map(String::as_str)
+                                .or_else(|| error.downcast_ref::<&str>().copied())
+                                .unwrap_or("native backend panicked");
+                            #raise_call;
+                        };
+                        if let ReturnType::Type(_, ty) = &f.sig.output
+                            && let Some(declared) = type_name(ty).and_then(|n| variants.get(&n))
+                        {
+                            if !backend_fns.iter().any(|b| b.name == native) {
+                                backend_fns.push(BackendFn {
+                                    name: native.clone(),
+                                    params: backend_types.clone(),
+                                    ret: quote!(-> #ty),
+                                    fallback: quote!(<#ty>::default()),
+                                });
+                            }
+                            let value = quote! {
+                                match #call {
+                                    Ok(value) => value,
+                                    Err(error) => { #raise <#ty>::default() }
+                                }
+                            };
+                            if target == RustTarget::Caribou {
+                                methods.extend(quote! {
+                                    pub extern "C" fn #name(#(#params),*) -> Enum<#ty> {
+                                        let value: #ty = #value;
+                                        value.into()
+                                    }
+                                });
+                                signatures.extend(quote!(fn #name(#(#types),*) -> Enum<#ty>;));
+                                continue;
+                            }
+                            // A runtime that cannot take the value whole takes
+                            // its variant's index, then each field it holds
+                            // through a getter that reads what this call kept.
+                            let slot = quote::format_ident!("__XIDL_{}_{}", class, name.unraw());
+                            let index = ident(&format!("{}Variant", name.unraw()))?;
+                            if !names.insert(index.to_string()) {
+                                return Err(format!(
+                                    "generated method {class}.{index} is duplicated"
+                                ));
+                            }
+                            statics.extend(quote! {
+                                thread_local! {
+                                    #[allow(non_upper_case_globals)]
+                                    static #slot: std::cell::RefCell<#ty> =
+                                        std::cell::RefCell::new(<#ty>::default());
+                                }
+                            });
+                            methods.extend(quote! {
+                                pub extern "C" fn #index(#(#params),*) -> i32 {
+                                    let value: #ty = #value;
+                                    let index = value.variant();
+                                    #slot.with(|slot| *slot.borrow_mut() = value);
+                                    index
+                                }
+                            });
+                            for (variant, fields) in declared {
+                                for (field, field_ty) in fields {
+                                    let getter = ident(&variant_getter(name, variant, field))?;
+                                    if !names.insert(getter.to_string()) {
+                                        return Err(format!(
+                                            "generated method {class}.{getter} is duplicated"
+                                        ));
+                                    }
+                                    let (ret, read, miss) = if let Some(e) =
+                                        generic(field_ty, "Enum")
+                                    {
+                                        (
+                                            quote!(Enum<#e>),
+                                            quote!((*found).into()),
+                                            quote!(#e::default().into()),
+                                        )
+                                    } else if type_name(field_ty).as_deref() == Some("Text") {
+                                        (quote!(Text), quote!(Text::new(found)), quote!(Text::NULL))
+                                    } else {
+                                        (
+                                            quote!(#field_ty),
+                                            quote!(*found),
+                                            quote!(Default::default()),
+                                        )
+                                    };
+                                    methods.extend(quote! {
+                                        pub extern "C" fn #getter() -> #ret {
+                                            #slot.with(|slot| match &*slot.borrow() {
+                                                #ty::#variant { #field: found, .. } => #read,
+                                                _ => #miss,
+                                            })
+                                        }
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         let (return_type, convert, fallback) = match &f.sig.output {
                             ReturnType::Default => (quote!(), quote!(value), quote!(())),
                             ReturnType::Type(_, ty) => {
@@ -2012,27 +2353,6 @@ fn generate_parts(
                                 fallback: fallback.clone(),
                             });
                         }
-                        // A panic in the backend becomes a runtime error in the
-                        // caller's language, and the fallback is returned.
-                        let call = quote! {
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                                backend::#native(#(#args),*)
-                            }))
-                        };
-                        let raise_call = if target == RustTarget::Caribou {
-                            quote!(caribou_abi::host::raise(
-                                caribou_abi::ErrorKind::Runtime,
-                                message
-                            ))
-                        } else {
-                            quote!(host::raise(ErrorKind::Runtime, message))
-                        };
-                        let raise = quote! {
-                            let message = error.downcast_ref::<String>().map(String::as_str)
-                                .or_else(|| error.downcast_ref::<&str>().copied())
-                                .unwrap_or("native backend panicked");
-                            #raise_call;
-                        };
                         let body = if return_type.is_empty() {
                             quote!(if let Err(error) = #call { #raise })
                         } else if convert.to_string() == "value" {
@@ -2077,6 +2397,7 @@ fn generate_parts(
                     };
                     output.extend(quote! {
                         #declaration
+                        #statics
                         impl #class {
                             #constructor
                             #methods
@@ -2105,6 +2426,7 @@ fn generate_parts(
             .collect(),
         idl_types,
         resources,
+        variants,
     };
 
     let output = if target == RustTarget::Caribou {
@@ -2207,8 +2529,9 @@ fn web_backend_for(
 mod test {
     use std::{env::temp_dir, path::PathBuf};
 
-    use crate::{enum_values, generate, generate_rayzor, pascal, tokens, web_backend};
-
+    use crate::{
+        enum_values, generate, generate_hashlink, generate_rayzor, pascal, tokens, web_backend,
+    };
 
     #[test]
     fn rayzor_model_uses_adapter_carriers_and_exports_native_symbols() {
@@ -2241,7 +2564,6 @@ mod test {
         assert!(generated.contains("param_types : [3u8 , 0u8"));
     }
 
-
     #[test]
     fn webidl_comments_and_spacing_do_not_change_enum_values() {
         let idl = tokens(
@@ -2269,7 +2591,7 @@ mod test {
 
     #[test]
     fn readonly_interface_attributes_can_generate_a_catalog_enum() {
-          let idl = r#"
+        let idl = r#"
           typedef (GPUSampler or GPUBuffer or GPUBufferBinding or GPUExternalTexture) GPUResource;
           dictionary GPUBufferBinding { required GPUBuffer buffer; unsigned long long size; };
           interface GPUSupportedLimits { readonly attribute unsigned long maxTextureDimension1D; readonly attribute unsigned long long maxBufferSize; };
@@ -2527,7 +2849,7 @@ mod test {
             "#,
         )
         .unwrap();
-        
+
         syn::parse_file(&generated).unwrap();
         assert!(generated.contains("pub enum Mode { # [default] Clamp , Repeat , Border }"));
         assert!(generated.contains("Self :: Border => 2"));
@@ -2583,7 +2905,139 @@ mod test {
         }
     }
 
-     #[test]
+    const VARIANTS_API: &str = r#"
+        enum Button { Left, Right }
+        enum Event {
+            None,
+            Closed,
+            Resized { width: i32, height: i32 },
+            Pressed { button: Enum<Button>, text: Text, repeat: bool, at: f64 },
+        }
+        trait Window {
+            #[native(window_poll)] fn poll(this: &Window) -> Event;
+        }
+    "#;
+
+    #[test]
+    fn caribou_takes_variants_whole() {
+        let generated = generate("window", make_declaration(VARIANTS_API), "").unwrap();
+        syn::parse_file(&generated).unwrap();
+        assert!(generated.contains("caribou_abi :: PluginEnum"));
+        assert!(generated.contains("# [caribou (name = \"window.Event\")]"));
+        assert!(
+            generated
+                .contains("Pressed { button : Button , text : String , repeat : bool , at : f64 }")
+        );
+        assert!(generated.contains("fn poll (this : & Window) -> Enum < Event >"));
+        assert!(generated.contains("fn poll (& Window) -> Enum < Event > ;"));
+        assert!(generated.contains("enum Event ;"));
+    }
+
+    #[test]
+    fn rayzor_and_hashlink_read_variants_field_by_field() {
+        let rayzor = generate_rayzor("window", make_declaration(VARIANTS_API), "").unwrap();
+        syn::parse_file(&rayzor).unwrap();
+        assert!(rayzor.contains("static __XIDL_Window_poll"));
+        assert!(rayzor.contains("fn pollVariant (this : & Window) -> i32"));
+        assert!(rayzor.contains("fn pollResizedWidth () -> i32"));
+        assert!(rayzor.contains("fn pollPressedText () -> Text"));
+        assert!(rayzor.contains("fn pollPressedButton () -> Enum < Button >"));
+        assert!(rayzor.contains("export_name = \"xidl_window_poll_pressed_text\""));
+        assert!(!rayzor.contains("PluginEnum"));
+
+        let hashlink = generate_hashlink("window", make_declaration(VARIANTS_API), "").unwrap();
+        syn::parse_file(&hashlink).unwrap();
+        assert!(hashlink.contains("hlp_window_poll_variant"));
+        assert!(hashlink.contains("\"Pi_i\""));
+        assert!(hashlink.contains("hlp_window_poll_pressed_at"));
+        assert!(hashlink.contains("\"P_d\""));
+
+        for runtime in [crate::haxe::Runtime::Rayzor, crate::haxe::Runtime::HashLink] {
+            let files =
+                crate::haxe::generate("window", make_declaration(VARIANTS_API), "", runtime)
+                    .unwrap();
+            let file = |name: &str| {
+                files
+                    .iter()
+                    .find(|f| f.path == format!("window/{name}.hx"))
+                    .unwrap()
+                    .source
+                    .clone()
+            };
+            assert!(file("Event").contains(
+                "enum Event {\n\tNone;\n\tClosed;\n\tResized(width:Int, height:Int);\n\tPressed(button:Button, text:String, repeat:Bool, at:Float);\n}"
+            ));
+            let window = file("Window");
+            assert!(
+                window.contains("inline function poll():Event {"),
+                "{window}"
+            );
+            assert!(window.contains("case 1: Event.Closed;"), "{window}");
+            assert!(window.contains("default: Event.None;"), "{window}");
+        }
+    }
+
+    #[test]
+    fn variants_are_results_with_a_bare_first_variant() {
+        for api in [
+            "enum E { A { x: i32 } } trait R { #[native(f)] fn f(this: &R) -> E; }",
+            "enum E { A, B { x: Vec<i32> } }",
+            "enum E { A, B { x: i32 } } trait R { #[native(f)] fn f(this: &R, e: E); }",
+            "enum E { A, B { x: i32 } } struct S { e: E }",
+            "enum E { A, B { x: Enum<Missing> } }",
+        ] {
+            assert!(
+                generate("w", make_declaration(api), "").is_err(),
+                "accepted {api}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_library_names_its_natives_and_record_abstracts() {
+        let api = r#"
+            struct Options { label: Option<Text> }
+            trait Device {
+                #[native(open)] fn open(options: &Options) -> Box<Device>;
+                #[native(read)] fn read(this: &Device) -> Buffer;
+            }
+        "#;
+        let library = crate::Library("xwindow");
+        let hashlink = library
+            .generate_hashlink("window", make_declaration(api), "")
+            .unwrap();
+        assert!(hashlink.contains("\"PXxwindow_Options__i\""));
+        assert!(hashlink.contains("\"Pi_Xxwindow_buffer_result_\""));
+        let rayzor = library
+            .generate_rayzor("window", make_declaration(api), "", &[])
+            .unwrap();
+        assert!(rayzor.contains("export_name = \"xwindow_device_open\""));
+        let files = library
+            .haxe(
+                "window",
+                make_declaration(api),
+                "",
+                crate::haxe::Runtime::HashLink,
+            )
+            .unwrap();
+        let all: String = files.iter().map(|f| f.source.as_str()).collect();
+        assert!(all.contains("@:hlNative(\"xwindow\", \"device_read\")"));
+        assert!(all.contains("hl.Abstract<\"xwindow_Options\">"));
+        assert!(all.contains("hl.Abstract<\"xwindow_buffer_result\">"));
+        assert!(!all.contains("\"xidl"));
+        assert!(
+            crate::Library("x-window")
+                .generate_hashlink("w", None, "")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unparsable_declaration_is_refused() {
+        assert!(generate("w", make_declaration("trait R {"), "").is_err());
+    }
+
+    #[test]
     fn a_web_backend_converts_records_to_the_wires_dictionaries() {
         let idl = r#"
           enum GPUFilterMode { "nearest", "linear" };
