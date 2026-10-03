@@ -1624,6 +1624,13 @@ fn hashlink_registration(
             }
             let call = quote!(#class::#function(#(#args),*));
             let (ret, body) = hashlink_return(call, &method.sig.output, plugin)?;
+            // HashLink throws by longjmp, which skips Rust destructors, so an
+            // error the call raised is thrown only once it has returned.
+            let body = quote!({
+                let value = #body;
+                host::throw_pending();
+                value
+            });
             let output = if ret.is_empty() {
                 quote!()
             } else {
@@ -3488,6 +3495,7 @@ mod test {
         assert!(hashlink.contains("a1 : f64) -> f64"), "{hashlink}");
         assert!(hashlink.contains("a1 as f32"), "{hashlink}");
         assert!(hashlink.contains("value as f64"), "{hashlink}");
+        assert!(hashlink.contains("host :: throw_pending ()"), "{hashlink}");
 
         let files = crate::haxe::generate(
             "gpu",
