@@ -1442,8 +1442,8 @@ fn hashlink_signature(
     }
     match type_name(ty).as_deref() {
         Some("bool") => Ok("b".into()),
-        Some("f32") => Ok("f".into()),
-        Some("f64") => Ok("d".into()),
+        // Haxe's Float is a double, so f32 crosses as one, as on Rayzor.
+        Some("f32" | "f64") => Ok("d".into()),
         Some("i32" | "u32") => Ok("i".into()),
         Some("i64" | "u64") => Ok("l".into()),
         Some("Text") if result => Ok("B".into()),
@@ -1506,7 +1506,8 @@ fn hashlink_argument(
             quote!(#name: *mut runtime::HlBytes),
             quote!(unsafe { BufferMut::from_hl(#name) }),
         )),
-        Some("i32" | "u32" | "i64" | "u64" | "f32" | "f64" | "bool") => {
+        Some("f32") => Ok((quote!(#name: f64), quote!(#name as f32))),
+        Some("i32" | "u32" | "i64" | "u64" | "f64" | "bool") => {
             Ok((quote!(#name: #ty), quote!(#name)))
         }
         Some(target) => Err(format!("unsupported HashLink argument {target}")),
@@ -1555,7 +1556,8 @@ fn hashlink_return(
             quote!(*mut runtime::Managed<Buffer>),
             quote!({ let value = #call; runtime::managed_new(value) }),
         )),
-        Some("i32" | "u32" | "i64" | "u64" | "f32" | "f64" | "bool") => {
+        Some("f32") => Ok((quote!(f64), quote!({ let value = #call; value as f64 }))),
+        Some("i32" | "u32" | "i64" | "u64" | "f64" | "bool") => {
             Ok((quote!(#ty), quote!({ #call })))
         }
         Some(target) => Err(format!("unsupported HashLink result {target}")),
@@ -3471,6 +3473,35 @@ mod test {
             assert!(window.contains("case 1: Event.Closed;"), "{window}");
             assert!(window.contains("default: Event.None;"), "{window}");
         }
+    }
+
+    #[test]
+    fn hashlink_carries_f32_as_the_double_haxe_declares() {
+        let api = r#"
+            trait Sampler {
+                #[native(sampler_scale)] fn scale(this: &Sampler, by: f32) -> f32;
+            }
+        "#;
+        let hashlink = generate_hashlink("gpu", make_declaration(api), "").unwrap();
+        syn::parse_file(&hashlink).unwrap();
+        assert!(hashlink.contains("\"Pid_d\""), "{hashlink}");
+        assert!(hashlink.contains("a1 : f64) -> f64"), "{hashlink}");
+        assert!(hashlink.contains("a1 as f32"), "{hashlink}");
+        assert!(hashlink.contains("value as f64"), "{hashlink}");
+
+        let files = crate::haxe::generate(
+            "gpu",
+            make_declaration(api),
+            "",
+            crate::haxe::Runtime::HashLink,
+        )
+        .unwrap();
+        let sampler = &files
+            .iter()
+            .find(|f| f.path == "gpu/Sampler.hx")
+            .unwrap()
+            .source;
+        assert!(sampler.contains("by:Float"), "{sampler}");
     }
 
     #[test]
