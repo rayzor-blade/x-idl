@@ -2965,6 +2965,78 @@ mod test {
     };
 
     #[test]
+    fn declaration_docs_reach_both_haxe_surfaces() {
+        let api = r#"
+            /// Light or dark.
+            enum Theme {
+                /// Dark text on light.
+                Light,
+                Dark,
+            }
+            enum Event {
+                None,
+                /// The new size.
+                Resized {
+                    /// Physical pixels.
+                    width: i32,
+                },
+            }
+            struct Attributes {
+                /// The title bar's text.
+                title: Option<Text>,
+                /// Logical pixels.
+                width: i32,
+            }
+            /// A window; "*/" stays inside.
+            trait Window {
+                /// Physical pixels.
+                #[native(window_x)] fn x(this: &Window) -> i32;
+            }
+        "#;
+        for runtime in [crate::haxe::Runtime::HashLink, crate::haxe::Runtime::Rayzor] {
+            let files = crate::haxe::generate("window", api, "", runtime).unwrap();
+            let file = |name: &str| {
+                let path = format!("window/{name}.hx");
+                files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .unwrap()
+                    .source
+                    .clone()
+            };
+            let theme = file("Theme");
+            assert!(
+                theme.contains("/** Light or dark. */\nenum abstract Theme"),
+                "{theme}"
+            );
+            assert!(
+                theme.contains("\t/** Dark text on light. */\n\tvar Light = 0;"),
+                "{theme}"
+            );
+            let event = file("Event");
+            assert!(
+                event.contains("\t/**\n\t * The new size.\n\t * @param width Physical pixels.\n\t */\n\tResized(width:Int);"),
+                "{event}"
+            );
+            let attributes = file("Attributes");
+            assert!(
+                attributes.contains("/** @param width Logical pixels. */"),
+                "{attributes}"
+            );
+            assert!(
+                attributes.contains("\t/** The title bar's text. */\n"),
+                "{attributes}"
+            );
+            let window = file("Window");
+            assert!(
+                window.contains("/** A window; \"*\\/\" stays inside. */\n"),
+                "{window}"
+            );
+            assert!(window.contains("\t/** Physical pixels. */\n"), "{window}");
+        }
+    }
+
+    #[test]
     fn an_optional_enum_argument_crosses_as_its_value_or_none() {
         let api = r#"
             enum Theme { Light, Dark }

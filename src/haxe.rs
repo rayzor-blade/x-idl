@@ -47,6 +47,7 @@ pub(crate) fn generate_in(
     let desc_content = declaration.text()?;
 
     let file = syn::parse_file(&desc_content);
+    let docs = file.as_ref().map(collect_docs).unwrap_or_default();
 
     let schema_namespace = namespace.rsplit('.').next().unwrap_or(namespace);
     let (_, _, plugin) = super::generate_parts(
@@ -99,7 +100,7 @@ private extern class XidlBytesNative {
                         out.push(source(
                             namespace,
                             &name,
-                            variants_enum(&name, declared, runtime)?,
+                            variants_enum(&name, declared, runtime, &docs)?,
                         ));
                         continue;
                     }
@@ -137,17 +138,19 @@ private extern class XidlBytesNative {
                     let mut next = 0;
                     let body = variants
                         .into_iter()
-                        .map(|(name, explicit)| {
+                        .map(|(variant, explicit)| {
                             let value = explicit.unwrap_or(next);
                             next = value.saturating_add(1);
-                            format!("\tvar {name} = {value};")
+                            let doc = comment(&docs, &format!("{name}.{variant}"), &[], "\t");
+                            format!("{doc}\tvar {variant} = {value};")
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let doc = comment(&docs, &name, &[], "");
                     out.push(source(
                         namespace,
                         &name,
-                        format!("enum abstract {name}(Int) from Int to Int {{\n{body}\n}}\n"),
+                        format!("{doc}enum abstract {name}(Int) from Int to Int {{\n{body}\n}}\n"),
                     ));
                 }
                 Item::Mod(item) => {
@@ -175,17 +178,19 @@ private extern class XidlBytesNative {
                     }
                     constants.extend(items.into_iter().filter_map(|item| match item {
                         Item::Const(c) => Some(format!(
-                            "\tpublic static inline var {}:Int = {};",
+                            "{}\tpublic static inline var {}:Int = {};",
+                            comment(&docs, &format!("{name}.{}", c.ident), &[], "\t"),
                             c.ident,
                             c.expr.to_token_stream()
                         )),
                         _ => None,
                     }));
                     let constants = constants.join("\n");
+                    let doc = comment(&docs, &name, &[], "");
                     out.push(source(
                         namespace,
                         &name,
-                        format!("class {name} {{\n{constants}\n}}\n"),
+                        format!("{doc}class {name} {{\n{constants}\n}}\n"),
                     ));
                 }
                 Item::Struct(item) => {
@@ -194,27 +199,34 @@ private extern class XidlBytesNative {
                         .get(&name)
                         .ok_or_else(|| format!("record {name} was not described"))?;
                     if runtime == Runtime::HashLink {
-                        out.push(hashlink_record(library, namespace, &name, record, &plugin)?);
+                        out.push(hashlink_record(
+                            library, namespace, &name, record, &plugin, &docs,
+                        )?);
                         continue;
                     }
                     let mut required = Vec::new();
+                    let mut params = Vec::new();
                     let mut methods = Vec::new();
+                    let doc = |field: &str| comment(&docs, &format!("{name}.{field}"), &[], "\t");
                     for (field, ty, _) in &record.fields {
                         let field = field.to_string().trim_start_matches("r#").to_owned();
                         if let Some((key, value)) = pair(ty, "Map") {
                             let method = format!("add{}", super::pascal(&field));
-                            methods.push(method_line(
-                                library,
-                                runtime,
-                                &name,
-                                &method,
-                                &format!(
-                                    "key:{}, value:{}",
-                                    hx_type(&key, runtime)?,
-                                    hx_type(&value, runtime)?
-                                ),
-                                "Void",
-                            ));
+                            methods.push(
+                                doc(&field)
+                                    + &method_line(
+                                        library,
+                                        runtime,
+                                        &name,
+                                        &method,
+                                        &format!(
+                                            "key:{}, value:{}",
+                                            hx_type(&key, runtime)?,
+                                            hx_type(&value, runtime)?
+                                        ),
+                                        "Void",
+                                    ),
+                            );
                         } else {
                             let (container, mut value) = if let Some(value) = one(ty, "Option") {
                                 ("option", value)
@@ -235,43 +247,55 @@ private extern class XidlBytesNative {
                                     } else {
                                         format!("{field}{variant}")
                                     };
-                                    methods.push(method_line(
-                                        library,
-                                        runtime,
-                                        &name,
-                                        &method,
-                                        &format!("value:{}", hx_type(ty, runtime)?),
-                                        "Void",
-                                    ));
+                                    methods.push(
+                                        doc(&field)
+                                            + &method_line(
+                                                library,
+                                                runtime,
+                                                &name,
+                                                &method,
+                                                &format!("value:{}", hx_type(ty, runtime)?),
+                                                "Void",
+                                            ),
+                                    );
                                 }
                             } else if container == "sequence" {
                                 let method = format!("add{}", super::pascal(&field));
-                                methods.push(method_line(
-                                    library,
-                                    runtime,
-                                    &name,
-                                    &method,
-                                    &format!("value:{}", hx_type(&value, runtime)?),
-                                    "Void",
-                                ));
+                                methods.push(
+                                    doc(&field)
+                                        + &method_line(
+                                            library,
+                                            runtime,
+                                            &name,
+                                            &method,
+                                            &format!("value:{}", hx_type(&value, runtime)?),
+                                            "Void",
+                                        ),
+                                );
                             } else if container == "option" {
-                                methods.push(method_line(
-                                    library,
-                                    runtime,
-                                    &name,
-                                    &field,
-                                    &format!("value:{}", hx_type(&value, runtime)?),
-                                    "Void",
-                                ));
+                                methods.push(
+                                    doc(&field)
+                                        + &method_line(
+                                            library,
+                                            runtime,
+                                            &name,
+                                            &field,
+                                            &format!("value:{}", hx_type(&value, runtime)?),
+                                            "Void",
+                                        ),
+                                );
                             } else {
                                 required.push(format!("{field}:{}", hx_type(&value, runtime)?));
+                                params.push((field.clone(), format!("{name}.{field}")));
                             }
                         }
                     }
                     let constructor = native(library, runtime, &name, "new");
                     let mut body = format!(
-                        "{}extern class {name} {{\n\t{constructor}\n\tpublic function new({});",
+                        "{}{}extern class {name} {{\n{}\t{constructor}\n\tpublic function new({});",
+                        comment(&docs, &name, &[], ""),
                         class_annotation(runtime, namespace, &name),
+                        comment(&docs, "", &params, "\t"),
                         required.join(", ")
                     );
                     if !methods.is_empty() {
@@ -285,7 +309,7 @@ private extern class XidlBytesNative {
                     let name = item.ident.to_string();
                     if runtime == Runtime::HashLink {
                         out.push(hashlink_resource(
-                            library, namespace, &name, &item, &plugin,
+                            library, namespace, &name, &item, &plugin, &docs,
                         )?);
                         continue;
                     }
@@ -297,6 +321,7 @@ private extern class XidlBytesNative {
                             continue;
                         };
                         let rust_name = method.sig.ident.to_string();
+                        let doc = comment(&docs, &format!("{name}.{rust_name}"), &[], "\t");
                         let mut args = Vec::new();
                         let mut typed = Vec::new();
                         let mut instance = false;
@@ -349,7 +374,7 @@ private extern class XidlBytesNative {
                             }
                             let names = arg_names(&args);
                             methods.push(format!(
-                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\treturn read{variants_name}({index}({names}));\n\t}}",
+                                "{doc}\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\treturn read{variants_name}({index}({names}));\n\t}}",
                                 args.join(", ")
                             ));
                             continue;
@@ -369,7 +394,7 @@ private extern class XidlBytesNative {
                                 format!("return {call}")
                             };
                             methods.push(format!(
-                                "\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\t{body};\n\t}}",
+                                "{doc}\tpublic {static_}inline function {rust_name}({}):{ret} {{\n\t\t{body};\n\t}}",
                                 args.join(", ")
                             ));
                             continue;
@@ -377,18 +402,19 @@ private extern class XidlBytesNative {
                         let annotation = native(library, runtime, &name, &rust_name);
                         if rust_name == "new" {
                             methods.push(format!(
-                                "\t{annotation}\n\tpublic function new({});",
+                                "{doc}\t{annotation}\n\tpublic function new({});",
                                 args.join(", ")
                             ));
                         } else {
                             methods.push(format!(
-                                "\t{annotation}\n\tpublic {static_}function {rust_name}({}):{ret};",
+                                "{doc}\t{annotation}\n\tpublic {static_}function {rust_name}({}):{ret};",
                                 args.join(", ")
                             ));
                         }
                     }
                     let body = format!(
-                        "{}extern class {name} {{\n{}\n}}\n",
+                        "{}{}extern class {name} {{\n{}\n}}\n",
+                        comment(&docs, &name, &[], ""),
                         class_annotation(runtime, namespace, &name),
                         methods.join("\n")
                     );
@@ -401,21 +427,26 @@ private extern class XidlBytesNative {
     Ok(out)
 }
 
+/// A record's setter, its parameters, and the field whose doc it carries.
+type Setter = (String, Vec<(String, Type)>, String);
+
 fn hashlink_record(
     library: &str,
     namespace: &str,
     name: &str,
     record: &super::convert::Record,
     plugin: &super::convert::Plugin,
+    docs: &Docs,
 ) -> Result<File, String> {
     let mut required = Vec::new();
-    let mut methods: Vec<(String, Vec<(String, Type)>)> = Vec::new();
+    let mut methods: Vec<Setter> = Vec::new();
     for (field, ty, _) in &record.fields {
         let field = field.to_string().trim_start_matches("r#").to_owned();
         if let Some((key, value)) = pair(ty, "Map") {
             methods.push((
                 format!("add{}", super::pascal(&field)),
                 vec![("key".into(), key), ("value".into(), value)],
+                field,
             ));
             continue;
         }
@@ -436,15 +467,16 @@ fn hashlink_record(
                 } else {
                     format!("{field}{variant}")
                 };
-                methods.push((method, vec![("value".into(), ty.clone())]));
+                methods.push((method, vec![("value".into(), ty.clone())], field.clone()));
             }
         } else if container == "sequence" {
             methods.push((
                 format!("add{}", super::pascal(&field)),
                 vec![("value".into(), value)],
+                field,
             ));
         } else if container == "option" {
-            methods.push((field, vec![("value".into(), value)]));
+            methods.push((field.clone(), vec![("value".into(), value)], field));
         } else {
             required.push((field, value));
         }
@@ -456,14 +488,20 @@ fn hashlink_record(
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let params: Vec<(String, String)> = required
+        .iter()
+        .map(|(field, _)| (field.clone(), format!("{name}.{field}")))
+        .collect();
     let mut public = format!(
-        "abstract {name}({abstract_ty}) {{\n\tpublic inline function new({args}) this = {name}Native.create({names});"
+        "{}abstract {name}({abstract_ty}) {{\n{}\tpublic inline function new({args}) this = {name}Native.create({names});",
+        comment(docs, name, &[], ""),
+        comment(docs, "", &params, "\t"),
     );
     let mut native_class = format!(
         "private extern class {name}Native {{\n\t{}\n\tpublic static function create({args}):{abstract_ty};",
         native(library, Runtime::HashLink, name, "new"),
     );
-    for (method, params) in methods {
+    for (method, params, field) in methods {
         let args = haxe_args(&params, Runtime::HashLink)?;
         let names = params
             .iter()
@@ -472,7 +510,8 @@ fn hashlink_record(
             .join(", ");
         let comma = if names.is_empty() { "" } else { ", " };
         public.push_str(&format!(
-            "\n\tpublic inline function {method}({args}):Void {name}Native.{method}(this{comma}{names});"
+            "\n{}\tpublic inline function {method}({args}):Void {name}Native.{method}(this{comma}{names});",
+            comment(docs, &format!("{name}.{field}"), &[], "\t"),
         ));
         native_class.push_str(&format!(
             "\n\t{}\n\tpublic static function {method}(self:{abstract_ty}{comma}{args}):Void;",
@@ -490,8 +529,12 @@ fn hashlink_resource(
     name: &str,
     item: &syn::ItemTrait,
     plugin: &super::convert::Plugin,
+    docs: &Docs,
 ) -> Result<File, String> {
-    let mut public = format!("abstract {name}(Int) from Int to Int {{");
+    let mut public = format!(
+        "{}abstract {name}(Int) from Int to Int {{",
+        comment(docs, name, &[], "")
+    );
     let mut native_class = format!("private extern class {name}Native {{");
     let mut text_getters = false;
     // The variants types whose readers this class has.
@@ -501,6 +544,7 @@ fn hashlink_resource(
             continue;
         };
         let rust_name = method.sig.ident.to_string();
+        let doc = comment(docs, &format!("{name}.{rust_name}"), &[], "\t");
         let mut params = Vec::new();
         let mut instance = false;
         for (at, arg) in method.sig.inputs.iter().enumerate() {
@@ -579,7 +623,7 @@ fn hashlink_resource(
             }
             let static_ = if instance { "" } else { "static " };
             public.push_str(&format!(
-                "\n\tpublic {static_}inline function {rust_name}({args}):{ret} {{\n\t\treturn read{variants_name}({name}Native.{index}({call_args}));\n\t}}"
+                "\n{doc}\tpublic {static_}inline function {rust_name}({args}):{ret} {{\n\t\treturn read{variants_name}({name}Native.{index}({call_args}));\n\t}}"
             ));
             continue;
         }
@@ -647,12 +691,12 @@ fn hashlink_resource(
         };
         if rust_name == "new" {
             public.push_str(&format!(
-                "\n\tpublic inline function new({args}) this = {call};"
+                "\n{doc}\tpublic inline function new({args}) this = {call};"
             ));
         } else {
             let static_ = if instance { "" } else { "static " };
             public.push_str(&format!(
-                "\n\tpublic {static_}inline function {rust_name}({args}):{ret} {body};"
+                "\n{doc}\tpublic {static_}inline function {rust_name}({args}):{ret} {body};"
             ));
         }
     }
@@ -679,20 +723,31 @@ fn variants_enum(
     name: &str,
     declared: &super::Variants,
     runtime: Runtime,
+    docs: &Docs,
 ) -> Result<String, String> {
     let mut body = Vec::new();
     for (variant, fields) in declared {
+        let params: Vec<(String, String)> = fields
+            .iter()
+            .map(|(field, _)| {
+                let field = field.unraw().to_string();
+                let key = format!("{name}.{variant}.{field}");
+                (field, key)
+            })
+            .collect();
+        let doc = comment(docs, &format!("{name}.{variant}"), &params, "\t");
         if fields.is_empty() {
-            body.push(format!("\t{variant};"));
+            body.push(format!("{doc}\t{variant};"));
             continue;
         }
         let fields = fields
             .iter()
             .map(|(field, ty)| Ok(format!("{}:{}", field.unraw(), hx_type(ty, runtime)?)))
             .collect::<Result<Vec<_>, String>>()?;
-        body.push(format!("\t{variant}({});", fields.join(", ")));
+        body.push(format!("{doc}\t{variant}({});", fields.join(", ")));
     }
-    Ok(format!("enum {name} {{\n{}\n}}\n", body.join("\n")))
+    let doc = comment(docs, name, &[], "");
+    Ok(format!("{doc}enum {name} {{\n{}\n}}\n", body.join("\n")))
 }
 
 /// How a Haxe surface reads a variants value: from its variant's index,
@@ -776,6 +831,119 @@ impl<'a> Reader<'a> {
             values[0]
         )
     }
+}
+
+/// The declaration's `///` text, by item (`Window`) and by member
+/// (`Window.setTheme`, `Theme.Dark`, `WindowAttributes.title`).
+type Docs = HashMap<String, Vec<String>>;
+
+fn doc_lines(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut lines: Vec<String> = attrs
+        .iter()
+        .filter(|a| a.path().is_ident("doc"))
+        .filter_map(|a| match &a.meta {
+            syn::Meta::NameValue(nv) => match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => Some(s.value()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|line| {
+            line.strip_prefix(' ')
+                .unwrap_or(&line)
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn collect_docs(file: &syn::File) -> Docs {
+    let mut docs = Docs::new();
+    let mut put = |key: String, attrs: &[syn::Attribute]| {
+        let lines = doc_lines(attrs);
+        if !lines.is_empty() {
+            docs.insert(key, lines);
+        }
+    };
+    for item in &file.items {
+        match item {
+            Item::Enum(e) => {
+                put(e.ident.to_string(), &e.attrs);
+                for v in &e.variants {
+                    put(format!("{}.{}", e.ident, v.ident), &v.attrs);
+                    for f in &v.fields {
+                        if let Some(field) = &f.ident {
+                            put(
+                                format!("{}.{}.{}", e.ident, v.ident, field.unraw()),
+                                &f.attrs,
+                            );
+                        }
+                    }
+                }
+            }
+            Item::Struct(s) => {
+                put(s.ident.to_string(), &s.attrs);
+                for f in &s.fields {
+                    if let Some(field) = &f.ident {
+                        put(format!("{}.{}", s.ident, field.unraw()), &f.attrs);
+                    }
+                }
+            }
+            Item::Trait(t) => {
+                put(t.ident.to_string(), &t.attrs);
+                for entry in &t.items {
+                    if let TraitItem::Fn(f) = entry {
+                        put(format!("{}.{}", t.ident, f.sig.ident), &f.attrs);
+                    }
+                }
+            }
+            Item::Mod(m) => {
+                put(m.ident.to_string(), &m.attrs);
+                for c in m.content.iter().flat_map(|(_, items)| items) {
+                    if let Item::Const(c) = c {
+                        put(format!("{}.{}", m.ident, c.ident), &c.attrs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    docs
+}
+
+/// `key`'s doc as a Haxe doc comment indented by `indent`, then a line of
+/// `@param` for each of `params` that has one; nothing when there is none.
+fn comment(docs: &Docs, key: &str, params: &[(String, String)], indent: &str) -> String {
+    let mut lines = docs.get(key).cloned().unwrap_or_default();
+    for (name, param_key) in params {
+        if let Some(text) = docs.get(param_key) {
+            lines.push(format!("@param {name} {}", text.join(" ")));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = lines.iter().map(|l| l.replace("*/", "*\\/")).collect();
+    if let [line] = lines.as_slice() {
+        return format!("{indent}/** {line} */\n");
+    }
+    let mut out = format!("{indent}/**\n");
+    for line in &lines {
+        if line.is_empty() {
+            out.push_str(&format!("{indent} *\n"));
+        } else {
+            out.push_str(&format!("{indent} * {line}\n"));
+        }
+    }
+    out.push_str(&format!("{indent} */\n"));
+    out
 }
 
 /// What an optional enum argument stands for when it is none: `i32::MIN`,
