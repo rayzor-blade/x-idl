@@ -1,2 +1,5 @@
 /target
 
+/tests/node-addon/target
+/tests/node-addon/generated.ts
+/tests/node-addon/test.node

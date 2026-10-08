@@ -3,6 +3,8 @@ mod forward;
 pub mod haxe;
 pub mod haxe_js;
 pub mod idl;
+pub mod node;
+pub mod typescript;
 pub mod wire;
 
 /// Generate complete conventional Haxe surface for one runtime.
@@ -936,6 +938,7 @@ fn scalar(ty: &Type) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RustTarget {
+    Node,
     Caribou,
     HashLink,
     Rayzor,
@@ -2541,7 +2544,7 @@ fn generate_parts(
                                     return Err("unknown enum".into());
                                 }
                                 backend_types.push(quote!(Option<i32>));
-                                if target == RustTarget::Caribou {
+                                if matches!(target, RustTarget::Caribou | RustTarget::Node) {
                                     quote!(#param.map(|v| v.get().native()))
                                 } else {
                                     lowered = true;
@@ -2614,6 +2617,12 @@ fn generate_parts(
                                     Err(error) => { #raise <#ty>::default() }
                                 }
                             };
+                            if target == RustTarget::Node {
+                                methods.extend(
+                                    quote! { pub fn #name(#(#params),*) -> #ty { #value } },
+                                );
+                                continue;
+                            }
                             if target == RustTarget::Caribou {
                                 methods.extend(quote! {
                                     pub extern "C" fn #name(#(#params),*) -> Enum<#ty> {

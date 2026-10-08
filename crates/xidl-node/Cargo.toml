@@ -1,0 +1,11 @@
+[package]
+name = "xidl-node"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Node-API carriers for x-idl generated bindings"
+repository = "https://github.com/rayzor-blade/x-idl"
+
+[dependencies]
+napi = { version = "3.14.2", default-features = false, features = ["napi8", "tokio_rt", "dyn-symbols"] }
+tokio = { version = "1", features = ["sync"] }
