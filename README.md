@@ -1,51 +1,93 @@
 # x-idl
 
-Generate native runtime bindings from one Rust declaration and expanded WebIDL
-model. Targets include HashLink/Ash, JavaScript runtimes, and Node with
-TypeScript declarations.
+Generate bindings for **Ash/HashLink, Rayzor, Caribou, and Node/TypeScript**
+from a shared API declaration. x-idl powers the runtime adapters in
+[xgpu](https://github.com/rayzor-blade/xgpu) and
+[xwindow](https://github.com/rayzor-blade/xwindow).
 
-## TypeScript and Node
+Declare resource methods, descriptors and events once. Import types and
+constants from WebIDL where needed. Each target generates the bindings for
+its runtime; the native backend implements the operations.
+
+## Supported targets
+
+| Target | Generated output | Guide |
+| --- | --- | --- |
+| Ash / HashLink | Haxe externs, native primitive resolvers, record wrappers and Ash futures | [Ash / HashLink](docs/runtimes.md#ash--hashlink) |
+| Rayzor | Haxe externs, C exports, method descriptors and runtime symbol registration | [Rayzor](docs/runtimes.md#rayzor) |
+| Caribou | Typed resource wrappers, record/enum schemas and a plugin export table for its frontends | [Caribou](docs/runtimes.md#caribou) |
+| Node / TypeScript | TypeScript bindings and a Node-API entry point with typed conversions | [Node / TypeScript](docs/node.md) |
+
+For browser adapters, x-idl also generates a
+[Rust/JavaScript wire protocol](docs/browser.md) from WebIDL.
+
+## One declaration, multiple runtimes
+
+An API declaration uses Rust syntax:
 
 ```rust
-let binding = x_idl::node::generate(
-    "gpu",
-    "api/gpu.rs",
-    include_str!("api/webgpu.idl"),
-)?;
-std::fs::write(out_dir.join("gpu.rs"), binding.rust)?;
-std::fs::write("generated/gpu.ts", binding.typescript)?;
+struct Options {
+    label: Text,
+    enabled: bool,
+}
+
+trait Device {
+    #[native(device_open)]
+    fn open(options: &Options) -> Box<Device>;
+
+    #[native(device_label)]
+    fn label(this: &Device) -> Text;
+}
 ```
 
-Include the generated Rust module in a Node-API addon and expose its `call`
-entry point. Bind its JavaScript export once:
+`Options` becomes a descriptor, `Device` a resource, and `#[native(...)]`
+selects the backend function. The generator reads this declaration; it is
+not compiled as an ordinary Rust trait implementation. WebIDL imports can
+supply dictionary fields, enum values, constants and union alternatives.
 
-```ts
-import { bind } from './generated/gpu.js';
+Add x-idl to the adapter's build dependencies:
 
-const gpu = bind({ call: addon.call });
-const instance = gpu.GpuInstance.new();
+```toml
+[build-dependencies]
+x_idl = { git = "https://github.com/rayzor-blade/x-idl" }
 ```
 
-`generate_with_entrypoint` supports multiple generated APIs in one addon.
-For declarations alone:
+Use the matching generator in `build.rs`. For example, an Ash adapter can
+produce its native bindings and Haxe surface together:
 
-```sh
-cargo run --bin xidl-typescript -- gpu api/gpu.rs api/webgpu.idl generated/gpu.ts
+```rust
+let library = x_idl::Library("devices");
+let api = std::path::PathBuf::from("api/devices.rs");
+let native = library.generate_hashlink("devices", api.clone(), "")?;
+let haxe = library.haxe("devices", api, "", x_idl::haxe::Runtime::HashLink)?;
 ```
 
-See [Node binding contracts](docs/node.md).
+The empty string is the WebIDL source; replace it with its contents when
+using imports. Pass declaration **source text** as a string, or a **file
+path** as `PathBuf`.
+
+See [runtime integration](docs/runtimes.md) for writing the generated files,
+including them in an adapter, and generating Rayzor and Caribou bindings.
+Runtime adapters supply memory ownership, futures and error handling; the
+backend remains shared.
 
 ## Verification
 
-Requires Rust and Node.js 24+ for the integration fixture.
+Run the generator tests, including Ash/HashLink, Rayzor, Caribou and
+TypeScript generation:
 
 ```sh
-cargo test --lib
+cargo test --locked --lib
+```
+
+The Node target also has a compiled addon fixture (Node.js 24+):
+
+```sh
 node tests/node-addon/run.mjs
 ```
 
-The fixture loads a compiled addon and verifies descriptors, typed resources,
-tagged events, bytes, large integers, asynchronous completion and invalid input.
-CI runs it on Linux, macOS and Windows.
+CI runs the generator tests on Linux and the Node fixture on Linux, macOS
+and Windows.
+The browser wire has separate [integration checks](docs/browser.md#verification).
 
-MIT.
+MIT. See [LICENSE](LICENSE).

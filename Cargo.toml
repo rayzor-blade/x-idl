@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/rayzor-blade/x-idl"
 license = "MIT"
-description = "IDL-based native bindings generator for Haxe and Node/TypeScript runtimes"
+description = "Bindings generator for Ash/HashLink, Rayzor, Caribou, and Node/TypeScript"
 
 
 [dependencies]

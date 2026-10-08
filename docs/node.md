@@ -5,6 +5,41 @@ It emits schema-specific Rust conversions and TypeScript descriptor encoders,
 plus numeric operation dispatch. It does not walk arbitrary object trees on
 every method call.
 
+## Generate an adapter
+
+Add `x_idl` as a build dependency and generate both sides from the same inputs:
+
+```rust
+let binding = x_idl::node::generate(
+    "gpu",
+    std::path::PathBuf::from("api/gpu.rs"),
+    include_str!("api/webgpu.idl"),
+)?;
+std::fs::write(out_dir.join("gpu.rs"), binding.rust)?;
+std::fs::create_dir_all("generated")?;
+std::fs::write("generated/gpu.ts", binding.typescript)?;
+```
+
+Include the generated Rust module in a Node-API addon and expose its `call`
+entry point. Bind its JavaScript export once:
+
+```ts
+import { bind } from './generated/gpu.js';
+
+const gpu = bind({ call: addon.call });
+const instance = gpu.GpuInstance.new();
+```
+
+For TypeScript output alone:
+
+```sh
+cargo run --bin xidl-typescript -- gpu api/gpu.rs api/webgpu.idl generated/gpu.ts
+```
+
+[The compiled fixture](../tests/node-addon) contains a build script, native
+backend and JavaScript integration test. See [runtime integration](runtimes.md)
+for the corresponding Ash/HashLink, Rayzor and Caribou generators.
+
 ## Runtime ownership
 
 Use `xidl-node` for the generated model's carrier types and `napi` /
