@@ -1,1 +1,1 @@
-{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":4,"timestamp":1791441635,"nonce":"/bl3nX1/y2Q3E5HoJFothB8S9g0=","status":2}]}
+{"author":{"id":"1832e4168d45d4ef31531146dbc743bb950a5dd543b15fd8e3a076fd976bfdef"},"ops":[{"type":2,"timestamp":1791444135,"nonce":"2v0aiqIhxQmJcLxLQlDBZvky4IU=","title":"Generate Node and TypeScript bindings from the shared API model","was":"Typed Node/TypeScript bindings, shared backend templates, numeric dispatch, bigint handles, checked byte views, async ownership and schema compatibility."}]}
