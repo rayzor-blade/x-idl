@@ -4,7 +4,8 @@ import { Worker } from 'node:worker_threads';
 import { bind, Mode, operations } from './generated.ts';
 
 const require = createRequire(import.meta.url);
-const native = require('./test.node');
+const nativePath = require.resolve('./test.node');
+const native = require(nativePath);
 const { Device, Other } = bind(native);
 const config = {
   title: 'hello',
@@ -55,7 +56,7 @@ structuredClone(detached.buffer,{transfer:[detached.buffer]});
 assert.throws(()=>Device.open({...config,bytes:detached}),/detached/);
 assert.throws(()=>Device.open({...config,bytes:new Uint8Array(new SharedArrayBuffer(2))}),/shared/);
 await new Promise((resolve,reject)=>{
-  const worker=new Worker(`const {parentPort}=require('node:worker_threads');try{require(${JSON.stringify(new URL('./test.node',import.meta.url).pathname)}).call(0,[]);parentPort.postMessage('unexpected');}catch(e){parentPort.postMessage(e.message);}`,{eval:true});
+  const worker=new Worker(`const {parentPort}=require('node:worker_threads');try{require(${JSON.stringify(nativePath)}).call(0,[]);parentPort.postMessage('unexpected');}catch(e){parentPort.postMessage(e.message);}`,{eval:true});
   worker.once('message',message=>{try{assert.match(message,/owning thread/);resolve();}catch(e){reject(e);}});
   worker.once('error',reject);
 });
