@@ -183,6 +183,12 @@ impl Buffer {
 pub struct BufferMut(Buffer);
 impl BufferMut {
     pub const NULL: Self = Self(Buffer::NULL);
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
     pub fn buffer(self) -> Buffer {
         self.0
     }
