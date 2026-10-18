@@ -651,7 +651,10 @@ impl Gen<'_> {
             }
             let args = names.join(", ");
             let call = match &op.call {
-                Call::Method(m) => format!("self.{m}({args})"),
+                Call::Method(m) => {
+                    let optional: Vec<bool> = op.args.iter().map(|a| a.optional).collect();
+                    method_call(m, &names, &optional)
+                }
                 Call::Get(a) => format!("self{}", js_key(a)),
                 Call::Set(a) => format!("(self{} = {args})", js_key(a)),
                 Call::Values => "Array.from(self.values())".to_owned(),
@@ -781,6 +784,24 @@ pub(crate) fn alternative_name(ty: &Ty) -> String {
 }
 
 /// The JavaScript expression reading a value of `ty` from `r`.
+/// `self.method(...)` with the trailing optional arguments the caller left out
+/// left off the call. An explicit `undefined` is the same call to most
+/// methods, but not to an overloaded one, which a browser may refuse once the
+/// page has run a while; leaving the argument off is the call that always works.
+fn method_call(method: &str, names: &[String], optional: &[bool]) -> String {
+    let required = optional.iter().rposition(|o| !o).map_or(0, |at| at + 1);
+    let call = |count: usize| format!("self.{method}({})", names[..count].join(", "));
+    let mut expression = call(required);
+    for count in required + 1..=names.len() {
+        expression = format!(
+            "({} === undefined ? {expression} : {})",
+            names[count - 1],
+            call(count)
+        );
+    }
+    expression
+}
+
 fn js_read(ty: &Ty) -> String {
     match ty {
         Ty::Undefined => "undefined".into(),
