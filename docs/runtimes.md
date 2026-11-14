@@ -131,6 +131,47 @@ still use the shared native handles.
 `x_idl::generate(...)` is the compatibility spelling of
 `generate_caribou(...)` used by existing adapters.
 
+## hxn
+
+[hxn](https://github.com/hx-n/hxn) builds a Rust library's bindings for
+HashLink, Ash, hxcpp and CPPIA, natively, for wasm, and for Android and iOS,
+from Rust items marked `#[hxn::interface]` and `#[hxn::data]`. The hxn target
+writes those items over the model, so the library is an ordinary hxn
+library:
+
+```rust
+let binding = x_idl::hxn::generate("devices", "devices", api, &idl)?;
+std::fs::write(out.join("devices.rs"), binding)?;
+```
+
+The second argument is the Haxe package of the classes. The library's crate
+includes the file at its root, beside the backend, which is installed scoped
+to `crate::model`:
+
+```rust
+mod backend {
+    include!(concat!(env!("OUT_DIR"), "/devices_backend/native.rs"));
+}
+include!(concat!(env!("OUT_DIR"), "/devices.rs"));
+```
+
+`hxn build` and `hxn run` then generate the adapters and the Haxe classes.
+The file holds:
+
+- `runtime`: carriers over plain Rust values. A failure the backend raises
+  is kept for the call's method, which returns it as an error once the call
+  has returned; hxn throws it on the Haxe side.
+- `model`: the shared model, with variants returned whole, as Node's target
+  has them.
+- At the crate root, each resource as an `#[hxn::interface]` over its handle,
+  each record as one over its fields, with its constructor and setters, and
+  each enum as `#[hxn::data]` with the model's numbers. Method names are
+  written in snake case, which hxn turns back into the declaration's.
+
+A method marked `#[blocking]` in the declaration is marked
+`#[hxn(blocking)]`, so each runtime is told the call waits. The other
+targets ignore the attribute.
+
 ## Existing integrations
 
 - [xgpu-bindgen](https://github.com/rayzor-blade/xgpu/tree/main/crates/xgpu-bindgen)

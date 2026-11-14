@@ -2,6 +2,7 @@ mod convert;
 mod forward;
 pub mod haxe;
 pub mod haxe_js;
+pub mod hxn;
 pub mod idl;
 pub mod node;
 pub mod typescript;

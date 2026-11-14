@@ -1,6 +1,6 @@
 # x-idl
 
-Generate bindings for **Ash/HashLink, Rayzor, Caribou, and Node/TypeScript**
+Generate bindings for **Ash/HashLink, Rayzor, Caribou, hxn, and Node/TypeScript**
 from a shared API declaration. x-idl powers the runtime adapters in
 [xgpu](https://github.com/rayzor-blade/xgpu) and
 [xwindow](https://github.com/rayzor-blade/xwindow).
@@ -16,6 +16,7 @@ its runtime; the native backend implements the operations.
 | Ash / HashLink | Haxe externs, native primitive resolvers, record wrappers and Ash futures | [Ash / HashLink](docs/runtimes.md#ash--hashlink) |
 | Rayzor | Haxe externs, C exports, method descriptors and runtime symbol registration | [Rayzor](docs/runtimes.md#rayzor) |
 | Caribou | Typed resource wrappers, record/enum schemas and a plugin export table for its frontends | [Caribou](docs/runtimes.md#caribou) |
+| hxn | Rust items marked for [hxn](https://github.com/hx-n/hxn), which builds HashLink, Ash, hxcpp and CPPIA bindings from them | [hxn](docs/runtimes.md#hxn) |
 | Node / TypeScript | TypeScript bindings and a Node-API entry point with typed conversions | [Node / TypeScript](docs/node.md) |
 
 For browser adapters, x-idl also generates a
