@@ -17,6 +17,10 @@
 //! A failure the backend raises is kept by `runtime::host::raise` and
 //! returned by the method as an error once the call has returned, which hxn
 //! throws on the Haxe side.
+//!
+//! A method that returns `Future<T>` returns an `hxn_future::Future`, which
+//! the backend's future settles; a library whose declaration has one depends
+//! on hxn-future.
 
 use crate::{Declaration, RustTarget, error, generic, type_name};
 use proc_macro2::TokenStream;
@@ -108,20 +112,42 @@ impl Text {
     pub fn as_str(&self) -> &str {
         self.0.as_deref().unwrap_or("")
     }
+
+    /// The text as a backend passes it on, such as to `Future::reject`.
+    pub fn value(self) -> Self {
+        self
+    }
 }
 
+/// Bytes the call passes: owned, or lent for the call to write into.
 #[derive(Clone, Default)]
-pub struct Buffer(Option<std::sync::Arc<[u8]>>);
+pub struct Buffer(Bytes);
+
+#[derive(Clone, Default)]
+enum Bytes {
+    #[default]
+    Null,
+    Owned(std::sync::Arc<[u8]>),
+    Lent(*mut u8, usize),
+}
+
+// A lent pointer lives only for the call that lends it, on its thread.
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
 
 impl Buffer {
-    pub const NULL: Self = Self(None);
+    pub const NULL: Self = Self(Bytes::Null);
 
     pub fn new(bytes: &[u8]) -> Self {
-        Self(Some(bytes.into()))
+        Self(Bytes::Owned(bytes.into()))
     }
 
     pub fn len(&self) -> usize {
-        self.0.as_deref().map_or(0, <[u8]>::len)
+        match &self.0 {
+            Bytes::Null => 0,
+            Bytes::Owned(bytes) => bytes.len(),
+            Bytes::Lent(_, len) => *len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -129,13 +155,29 @@ impl Buffer {
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.0.as_deref().map_or(std::ptr::null(), <[u8]>::as_ptr)
+        match &self.0 {
+            Bytes::Null => std::ptr::null(),
+            Bytes::Owned(bytes) => bytes.as_ptr(),
+            Bytes::Lent(bytes, _) => *bytes,
+        }
+    }
+
+    /// The bytes to write into, when they are lent rather than owned.
+    pub fn as_mut_ptr(&self) -> Option<*mut u8> {
+        match &self.0 {
+            Bytes::Lent(bytes, _) => Some(*bytes),
+            _ => None,
+        }
     }
 
     /// # Safety
-    /// None beyond the borrow: the bytes are owned.
+    /// Lent bytes must still be lent: only within the call.
     pub unsafe fn as_slice(&self) -> &[u8] {
-        self.0.as_deref().unwrap_or(&[])
+        match &self.0 {
+            Bytes::Null => &[],
+            Bytes::Owned(bytes) => bytes,
+            Bytes::Lent(bytes, len) => unsafe { std::slice::from_raw_parts(*bytes, *len) },
+        }
     }
 }
 
@@ -166,12 +208,87 @@ impl BufferMut {
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.bytes
     }
+
+    /// The same lent bytes as a `Buffer`.
+    pub fn buffer(&self) -> Buffer {
+        Buffer(Bytes::Lent(self.bytes, self.len))
+    }
 }
 
-pub struct Future<T = ()>(std::marker::PhantomData<fn() -> T>);
+/// One result the backend settles, now or later; the method hands it to
+/// Haxe as an `hxn_future::Future`.
+pub struct Future<T = ()>(Option<std::sync::Arc<std::sync::Mutex<Settling<T>>>>);
+
+type Settled<T> = Result<Box<T>, String>;
+
+pub enum Settling<T> {
+    Pending(Option<Box<dyn FnOnce(Settled<T>) + Send>>),
+    Done(Option<Settled<T>>),
+}
+
+impl<T> Clone for Future<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> Default for Future<T> {
+    fn default() -> Self {
+        Self::NULL
+    }
+}
 
 impl<T> Future<T> {
-    pub const NULL: Self = Self(std::marker::PhantomData);
+    pub const NULL: Self = Self(None);
+
+    pub fn new() -> Self {
+        Self(Some(std::sync::Arc::new(std::sync::Mutex::new(Settling::Pending(None)))))
+    }
+
+    pub fn resolve_boxed(self, value: Box<T>) -> bool {
+        self.settle(Ok(value))
+    }
+
+    pub fn reject(self, message: Text) -> bool {
+        self.settle(Err(message.as_str().to_owned()))
+    }
+
+    /// Hands the result to `then`, or keeps it until `then` is given.
+    fn settle(self, result: Settled<T>) -> bool {
+        let Some(state) = self.0 else { return false };
+        let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &mut *state {
+            Settling::Pending(then) => match then.take() {
+                Some(then) => {
+                    *state = Settling::Done(None);
+                    drop(state);
+                    then(result);
+                    true
+                }
+                None => {
+                    *state = Settling::Done(Some(result));
+                    true
+                }
+            },
+            Settling::Done(_) => false,
+        }
+    }
+
+    /// Runs `then` with the result once it is settled, at once if it is.
+    /// A null future never settles.
+    pub fn then(self, then: impl FnOnce(Settled<T>) + Send + 'static) {
+        let Some(state) = self.0 else { return };
+        let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &mut *state {
+            Settling::Pending(waiting) => *waiting = Some(Box::new(then)),
+            Settling::Done(result) => {
+                if let Some(result) = result.take() {
+                    drop(state);
+                    then(result);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -221,8 +338,13 @@ fn snake(name: &str) -> String {
     out
 }
 
+/// A keyword, such as a parameter named `type`, takes a trailing `_`.
 fn snake_ident(ident: &syn::Ident) -> syn::Ident {
-    format_ident!("{}", snake(&ident.unraw().to_string()))
+    let name = snake(&ident.unraw().to_string());
+    match syn::parse_str::<syn::Ident>(&name) {
+        Ok(ident) => ident,
+        Err(_) => format_ident!("{name}_"),
+    }
 }
 
 /// The kinds of type the model declares, by name.
@@ -328,6 +450,25 @@ fn result(ty: &Type, kinds: &Kinds) -> Result<(TokenStream, TokenStream), String
     if let Some(inner) = generic(ty, "Enum") {
         let e = format_ident!("{}", type_name(&inner).ok_or("an unnamed enum")?);
         return Ok((quote!(#e), quote!(#e::from(value.get()))));
+    }
+    // The backend settles its future with a boxed value, made into hxn's
+    // value as a `Box` result is.
+    if let Some(inner) = generic(ty, "Future") {
+        let boxed: Type = syn::parse_quote!(Box<#inner>);
+        let (settled, made) = result(&boxed, kinds)?;
+        return Ok((
+            quote!(Future<#settled>),
+            quote!({
+                let (completer, future) = hxn_future::pending::<#settled>();
+                value.then(move |settled| {
+                    let _ = match settled {
+                        Ok(value) => completer.resolve(#made),
+                        Err(message) => completer.reject(message),
+                    };
+                });
+                future
+            }),
+        ));
     }
     if let Some(inner) = generic(ty, "Box")
         && let Some((class, kind)) = kinds.named(&inner)
@@ -477,7 +618,9 @@ fn enumeration(
             .iter()
             .map(|f| f.ident.clone().unwrap())
             .collect();
-        for field in &fields.named {
+        // hxn's fields are snake case; the model keeps the IDL's names.
+        let hxn_names: Vec<_> = names.iter().map(snake_ident).collect();
+        for (field, h) in fields.named.iter().zip(&hxn_names) {
             let f = field.ident.as_ref().unwrap();
             let ty = &field.ty;
             let (hxn_ty, out, back) = if type_name(ty).as_deref() == Some("VariantBytes") {
@@ -496,30 +639,47 @@ fn enumeration(
                     quote!(#ty)
                 ));
             };
-            declared.push(quote!(#f: #hxn_ty));
-            out_fields.push(quote!(#f: #out));
-            in_fields.push(quote!(#f: #back));
+            declared.push(quote!(#h: #hxn_ty));
+            out_fields.push(shorthand(h, out));
+            in_fields.push(shorthand(f, back));
         }
+        let bound = hxn_names
+            .iter()
+            .zip(&names)
+            .map(|(h, f)| shorthand(h, quote!(#f)));
         variants.push(quote!(#v { #(#declared),* }));
         out_arms.push(quote!(model::#name::#v { #(#names),* } => Self::#v { #(#out_fields),* }));
-        in_arms.push(quote!(#name::#v { #(#names),* } => Self::#v { #(#in_fields),* }));
+        in_arms.push(quote!(#name::#v { #(#bound),* } => Self::#v { #(#in_fields),* }));
     }
     Ok(quote! {
         #(#docs)*
         #[hxn::data]
         #[derive(Clone, Debug, PartialEq)]
         pub enum #name { #(#variants),* }
+        // The model's fields keep the IDL's names.
+        #[allow(non_snake_case)]
         impl From<model::#name> for #name {
             fn from(value: model::#name) -> Self {
                 match value { #(#out_arms),* }
             }
         }
+        #[allow(non_snake_case)]
         impl From<#name> for model::#name {
             fn from(value: #name) -> Self {
                 match value { #(#in_arms),* }
             }
         }
     })
+}
+
+/// `name: value` in a pattern or a struct expression, or `name` alone when
+/// the value is that name.
+fn shorthand(name: &syn::Ident, value: TokenStream) -> TokenStream {
+    if *name == value.to_string() {
+        quote!(#name)
+    } else {
+        quote!(#name: #value)
+    }
 }
 
 /// The numbers a C-like enum's `native` gives each variant, from the model.
@@ -687,9 +847,17 @@ pub fn generate(
     }
 
     let runtime: TokenStream = RUNTIME.parse().map_err(error)?;
+    // hxn reads a future result by its bare name; the library then depends
+    // on hxn-future.
+    let futures = out.to_string().contains("hxn_future :: pending").then(|| {
+        quote!(
+            use hxn_future::Future;
+        )
+    });
     let model: TokenStream = model.parse().map_err(error)?;
     let file = quote! {
         hxn::package!(#package);
+        #futures
 
         #[allow(dead_code, clippy::all)]
         pub mod runtime { #runtime }
@@ -697,9 +865,10 @@ pub fn generate(
         #[allow(dead_code, non_snake_case, unused_imports, unused_unsafe, improper_ctypes_definitions, clippy::all)]
         pub mod model {
             use super::backend;
-            // A backend installed scoped to the model finds the carriers here.
+            // A backend installed scoped to the model finds the carriers here,
+            // by name or through a glob of the model.
             pub use super::runtime;
-            use super::runtime::{Buffer, BufferMut, Enum, ErrorKind, Future, NativeEnum, Rooted, Text, host};
+            pub use super::runtime::{Buffer, BufferMut, Enum, ErrorKind, Future, NativeEnum, Rooted, Text, host};
             #model
         }
 
@@ -738,6 +907,7 @@ mod tests {
             None,
             Resized { width: i64, height: i64 },
             ThemeChanged { theme: Enum<Theme> },
+            Moved { screenX: i64 },
         }
 
         /// What a window opens with.
@@ -760,6 +930,8 @@ mod tests {
             fn setTheme(this: &Window, theme: Option<Enum<Theme>>);
             #[native(window_close)]
             fn close(this: &Window);
+            #[native(window_snapshot)]
+            fn snapshot(this: &Window, r#type: i32, destination: BufferMut) -> Future<Window>;
         }
     "#;
 
@@ -804,7 +976,36 @@ mod tests {
         let out = binding();
         assert!(out.contains("# [doc = \" Light or dark.\"] # [hxn :: data]"));
         assert!(out.contains("pub enum Theme { Light = 0 , Dark = 1 }"));
-        assert!(out.contains("pub enum Event { None , Resized { width : i64 , height : i64 } , ThemeChanged { theme : Theme } }"));
+        assert!(out.contains("pub enum Event { None , Resized { width : i64 , height : i64 } , ThemeChanged { theme : Theme } , Moved { screen_x : i64 } }"));
         assert!(out.contains("model :: Event :: ThemeChanged { theme } => Self :: ThemeChanged { theme : theme . into () }"));
+    }
+
+    #[test]
+    fn fields_and_parameters_are_snake_case_rust_names() {
+        let out = binding();
+        assert!(out.contains("Moved { screen_x : i64 }"));
+        assert!(out.contains("Event :: Moved { screen_x : screenX } => Self :: Moved { screenX }"));
+        assert!(out.contains("type_ : i32"));
+    }
+
+    #[test]
+    fn a_future_result_is_settled_into_an_hxn_future() {
+        let out = binding();
+        assert!(out.contains("use hxn_future :: Future ;"));
+        assert!(out.contains(
+            "pub fn snapshot (& self , type_ : i32 , destination : & mut [u8]) -> Result < Future < Window > , Raised >"
+        ));
+        assert!(out.contains("hxn_future :: pending :: < Window > ()"));
+        assert!(out.contains("completer . resolve (Window { handle : value . handle })"));
+    }
+
+    #[test]
+    fn a_declaration_without_futures_needs_no_hxn_future() {
+        let api = API.replace(
+            "fn snapshot(this: &Window, r#type: i32, destination: BufferMut) -> Future<Window>;",
+            "fn snapshot(this: &Window, r#type: i32, destination: BufferMut);",
+        );
+        let out = super::generate("window", "window", api.as_str(), "").unwrap();
+        assert!(!out.contains("hxn_future ::"));
     }
 }
