@@ -592,6 +592,8 @@ impl Gen<'_> {
     fn ops(&mut self, ops: &[Op]) {
         let mut methods = String::from("\nimpl Encoder {\n");
         let mut table = String::from("\nexport const OPS = [\n");
+        // Each op's IDL name, for the failure of a command that threw.
+        let mut names = String::from("\nexport const NAMES = [\n");
         for (n, op) in ops.iter().enumerate() {
             // Rust: one method per op.
             let mut params = String::from("&mut self, this: Handle");
@@ -624,6 +626,8 @@ impl Gen<'_> {
                 "    /// `{}`.\n    pub fn {}({params}) {{\n{body}    }}",
                 op.idl, op.method
             );
+
+            let _ = writeln!(names, "  {:?},", op.idl);
 
             // JavaScript: the op's decoder, at its number.
             let mut js = format!(
@@ -680,7 +684,7 @@ impl Gen<'_> {
             if op.promise {
                 let _ = writeln!(
                     js,
-                    "    {call}.then((v) => {{ {keep}wire.reply(reply, 1, {answer}); }}, (e) => wire.reply(reply, 2, message(e)));"
+                    "    let p;\n    try {{ p = {call}; }} catch (e) {{ wire.reply(reply, 2, message(e)); return; }}\n    p.then((v) => {{ {keep}wire.reply(reply, 1, {answer}); }}, (e) => wire.reply(reply, 2, message(e)));"
                 );
             } else if op.replies {
                 let _ = writeln!(
@@ -706,8 +710,10 @@ impl Gen<'_> {
         );
         methods.push_str("}\n");
         table.push_str("];\n");
+        names.push_str("  \"release\",\n];\n");
         self.rust.push_str(&methods);
         self.js.push_str(&table);
+        self.js.push_str(&names);
         let _ = writeln!(
             self.rust,
             "\n/// The number of operations the wire carries.\npub const OPS: u32 = {};",
@@ -1351,9 +1357,9 @@ export class Wire {
       }
     }
   }
-  /// A command that threw, which has no reply to carry it.
-  error(e) {
-    console.error(e);
+  /// A command that threw, which has no reply to carry it: `op` is its IDL name.
+  error(e, op) {
+    console.error(`${op}:`, e);
   }
 }
 
@@ -1477,7 +1483,7 @@ export function execute(wire, at, len) {
     try {
       OPS[op](wire, r);
     } catch (e) {
-      wire.error(e);
+      wire.error(e, NAMES[op] ?? `op ${op}`);
     }
     at += 8 + n;
   }
