@@ -92,3 +92,8 @@ and Windows.
 The browser wire has separate [integration checks](docs/browser.md#verification).
 
 MIT. See [LICENSE](LICENSE).
+
+The hxn target also provides `hxn::generate_with_agent` to delegate browser-agent
+startup to an adapter function, and `hxn::web_backend` for browser forwarders
+using the same plain Rust model. Agent loading and runtime imports stay in the
+adapter.

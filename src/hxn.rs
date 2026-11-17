@@ -729,6 +729,19 @@ pub fn generate(
     declaration: impl Into<Declaration>,
     webidl: &str,
 ) -> Result<String, String> {
+    generate_with_agent(namespace, package, declaration, webidl, None)
+}
+
+/// Generate a binding whose host delegates browser-agent startup to `agent`,
+/// a Rust function path with signature `fn(&str, usize) -> bool`.
+/// Without a hook, asking for an agent returns false.
+pub fn generate_with_agent(
+    namespace: &str,
+    package: &str,
+    declaration: impl Into<Declaration>,
+    webidl: &str,
+    agent: Option<&str>,
+) -> Result<String, String> {
     let declaration = declaration.into();
     let (model, _, _) = crate::generate_parts(
         namespace,
@@ -842,11 +855,33 @@ pub fn generate(
             #[hxn::interface]
             pub struct #class { #held }
             #[hxn::methods]
+            #[allow(clippy::let_unit_value)]
             impl #class { #(#methods)* }
         });
     }
 
-    let runtime: TokenStream = RUNTIME.parse().map_err(error)?;
+    let mut runtime = syn::parse_file(RUNTIME).map_err(error)?;
+    if let Some(agent) = agent {
+        let agent: syn::Path = syn::parse_str(agent).map_err(error)?;
+        for item in &mut runtime.items {
+            if let Item::Mod(host) = item
+                && host.ident == "host"
+                && let Some((_, items)) = &mut host.content
+            {
+                for item in items {
+                    if let Item::Fn(function) = item
+                        && function.sig.ident == "agent"
+                    {
+                        *function = syn::parse_quote! {
+                            pub fn agent(name: &str, address: usize) -> bool {
+                                #agent(name, address)
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
     // hxn reads a future result by its bare name; the library then depends
     // on hxn-future.
     let futures = out.to_string().contains("hxn_future :: pending").then(|| {
@@ -854,13 +889,14 @@ pub fn generate(
             use hxn_future::Future;
         )
     });
+    let runtime = runtime.items;
     let model: TokenStream = model.parse().map_err(error)?;
     let file = quote! {
         hxn::package!(#package);
         #futures
 
         #[allow(dead_code, clippy::all)]
-        pub mod runtime { #runtime }
+        pub mod runtime { #(#runtime)* }
 
         #[allow(dead_code, non_snake_case, unused_imports, unused_unsafe, improper_ctypes_definitions, clippy::all)]
         pub mod model {
@@ -894,8 +930,50 @@ pub fn generate(
     Ok(file.to_string())
 }
 
+/// Browser forwarders for the plain Rust model used by an hxn binding.
+pub fn web_backend(
+    namespace: &str,
+    declaration: impl Into<Declaration>,
+    webidl: &str,
+    implemented: &str,
+) -> Result<String, String> {
+    crate::web_backend_for(
+        namespace,
+        declaration.into(),
+        webidl,
+        implemented,
+        RustTarget::Node,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_agents_use_the_adapters_hook() {
+        let source = super::generate_with_agent(
+            "window",
+            "hxn.window",
+            API,
+            "",
+            Some("crate::browser::agent"),
+        )
+        .unwrap();
+        assert!(source.contains("crate :: browser :: agent (name , address)"));
+        assert!(
+            super::generate_with_agent("window", "hxn.window", API, "", Some("not a path"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_forwarders_keep_whole_variant_results() {
+        let source =
+            super::web_backend("window", API, "", "pub unsafe fn window_wait() {}").unwrap();
+        assert!(source.contains("-> Event"));
+        assert!(source.contains("crate :: web :: window_wait"));
+        assert!(source.contains("window: `window_open` is not available on the web"));
+    }
+
     const API: &str = r#"
         /// Light or dark.
         enum Theme {
